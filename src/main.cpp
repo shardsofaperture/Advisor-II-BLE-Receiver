@@ -42,6 +42,10 @@ struct PageRecord {
   uint32_t capcode = 0;
   String message;
   uint32_t timestampMs = 0;
+
+  PageRecord() = default;
+  PageRecord(uint32_t capcodeIn, const String &messageIn, uint32_t timestampMsIn)
+      : capcode(capcodeIn), message(messageIn), timestampMs(timestampMsIn) {}
 };
 
 class PageStore {
@@ -446,6 +450,10 @@ struct TxRequest {
   uint32_t capcode = 0;
   String message;
   bool store = true;
+
+  TxRequest() = default;
+  TxRequest(uint32_t capcodeIn, const String &messageIn, bool storeIn)
+      : capcode(capcodeIn), message(messageIn), store(storeIn) {}
 };
 
 enum class ProbeMode { kNone, kSequential, kBinary };
