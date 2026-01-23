@@ -10,6 +10,20 @@ This project implements a BLE-to-pager bridge for the Seeed XIAO ESP32-S3. An An
 
 ## Build & flash
 
+### PlatformIO (recommended for VS Code)
+
+1. Install the **PlatformIO IDE** extension in VS Code.
+2. Open this repo folder in VS Code.
+3. Use the PlatformIO toolbar:
+   - **Build** (`pio run`)
+   - **Upload** (`pio run -t upload`)
+   - **Monitor** (`pio device monitor`)
+
+The project layout matches PlatformIO conventions (`src`, `include`, `lib`, `test`) and
+uses the `platformio.ini` configuration at the repo root.
+
+### ESP-IDF (command line)
+
 ```bash
 idf.py set-target esp32s3
 idf.py build flash monitor
