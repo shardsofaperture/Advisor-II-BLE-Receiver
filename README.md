@@ -49,14 +49,30 @@ Open the serial monitor at 115200 baud. Type the same commands as BLE (ending wi
 Commands are **plain text** and case-insensitive. Examples show the exact text to send.
 
 ### STATUS
-Shows a single-line summary (capcode/baud/invert/pins/pages).
+Shows a single-line summary (capcodes/baud/invert/pins/pages).
 ```
 STATUS
 ```
 
 ### SET CAPCODE <int>
+Sets the individual capcode (and group to IND+1 unless already set explicitly).
 ```
-SET CAPCODE 91833
+SET CAPCODE 0123456
+```
+
+### SET CAPIND <int>
+```
+SET CAPIND 0123456
+```
+
+### SET CAPGRP <int>
+```
+SET CAPGRP 0123457
+```
+
+### SET CAPS <ind> <grp>
+```
+SET CAPS 0123456 0123457
 ```
 
 ### SET BAUD <512|1200|2400|6400>
@@ -70,21 +86,33 @@ SET INVERT 1
 ```
 
 ### SET AUTOPROBE <0|1>
-Enable/disable a one-time probe on boot (tries the saved capcode once).
+Enable/disable a one-time probe on boot (tries the saved IND then GRP capcodes once).
 ```
 SET AUTOPROBE 1
 ```
 
 ### PAGE <text>
-Send a page to the configured capcode.
+Send a page to the configured individual capcode (CAPIND).
 ```
-PAGE Hello from PagerBridge
+PAGE Hello
+```
+
+### PAGEI <text>
+Force a page to the individual capcode.
+```
+PAGEI Hello
+```
+
+### PAGEG <text>
+Force a page to the group capcode.
+```
+PAGEG Hello
 ```
 
 ### PAGE <capcode> <text>
 Send to a specific capcode.
 ```
-PAGE 91833 Test page
+PAGE 0123457 Hello
 ```
 
 ### LIST
@@ -130,7 +158,7 @@ PROBE ONESHOT 91833 91834 91835
 ```
 
 ### SAVE
-Force-save settings to NVS (capcode/baud/invert/autoprobe + recent pages).
+Force-save settings to NVS (capcodes/baud/invert/autoprobe + recent pages).
 ```
 SAVE
 ```
@@ -141,7 +169,7 @@ SAVE
 3. Open Serial Monitor at 115200 and confirm the boot banner prints settings.
 4. Send a page:
    ```
-   PAGE 91833 Hello
+   PAGE Hello
    ```
 5. If the pager wakes but doesn’t decode, toggle invert:
    ```
@@ -156,5 +184,8 @@ SAVE
   Toggle `SET INVERT 0/1`. The DATA line polarity must match the logic board.
 - **Nothing happens at all**  
   Verify **common ground** and the DATA injection node continuity to the TA31142 pin 15 net.
-- **Probe doesn’t auto-save capcode**  
+- **Probe doesn’t auto-save capcodes**  
   `PROBE START` and `PROBE BINARY` **require ALERT_GPIO**. If ALERT_GPIO isn’t wired, you’ll get `ERROR PROBE NO_ALERT_GPIO`. Use `PROBE ONESHOT` and watch the pager manually.
+
+### Notes
+- Leading zeros are fine to type; the pager address is numeric.

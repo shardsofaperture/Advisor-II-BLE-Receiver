@@ -14,7 +14,8 @@ constexpr const char *kDeviceName = "PagerBridge";
 // Compile-time configuration.
 constexpr int kDataGpio = 2;
 constexpr int kAlertGpio = -1;
-constexpr uint32_t kDefaultCapcode = 91833;
+constexpr uint32_t kDefaultCapcodeInd = 123456;
+constexpr uint32_t kDefaultCapcodeGrp = 123457;
 constexpr uint32_t kDefaultBaud = 1200;
 constexpr bool kDefaultInvert = true;
 constexpr size_t kPageStoreCapacity = 20;
@@ -827,11 +828,13 @@ static ProbeController probe(tx, encoder);
 static CommandParser parser;
 
 static std::deque<TxRequest> txQueue;
-static uint32_t configuredCapcode = kDefaultCapcode;
+static uint32_t configuredCapcodeInd = kDefaultCapcodeInd;
+static uint32_t configuredCapcodeGrp = kDefaultCapcodeGrp;
 static uint32_t configuredBaud = kDefaultBaud;
 static bool configuredInvert = kDefaultInvert;
 static bool configuredAutoProbe = false;
 static bool pendingStoredPage = false;
+static bool capGrpWasExplicitlySet = false;
 
 static String serialBuffer;
 
@@ -847,7 +850,9 @@ void queueStatus(const String &message) {
 }
 
 void saveSettings() {
-  preferences.putUInt("capcode", configuredCapcode);
+  preferences.putUInt("cap_ind", configuredCapcodeInd);
+  preferences.putUInt("cap_grp", configuredCapcodeGrp);
+  preferences.putUInt("capcode", configuredCapcodeInd);
   preferences.putUInt("baud", configuredBaud);
   preferences.putBool("invert", configuredInvert);
   preferences.putBool("autoProbe", configuredAutoProbe);
@@ -885,9 +890,35 @@ void handleCommand(const std::vector<String> &tokens) {
     String key = tokens[1];
     key.toUpperCase();
     if (key == "CAPCODE") {
-      configuredCapcode = tokens[2].toInt();
+      configuredCapcodeInd = tokens[2].toInt();
+      if (!capGrpWasExplicitlySet) {
+        configuredCapcodeGrp = configuredCapcodeInd + 1;
+      }
       saveSettings();
-      queueStatus("STATUS CAPCODE=" + String(configuredCapcode));
+      queueStatus("STATUS CAPS CAPIND=" + String(configuredCapcodeInd) +
+                  " CAPGRP=" + String(configuredCapcodeGrp));
+      return;
+    }
+    if (key == "CAPIND") {
+      configuredCapcodeInd = tokens[2].toInt();
+      saveSettings();
+      queueStatus("STATUS CAPIND=" + String(configuredCapcodeInd));
+      return;
+    }
+    if (key == "CAPGRP") {
+      configuredCapcodeGrp = tokens[2].toInt();
+      capGrpWasExplicitlySet = true;
+      saveSettings();
+      queueStatus("STATUS CAPGRP=" + String(configuredCapcodeGrp));
+      return;
+    }
+    if (key == "CAPS" && tokens.size() >= 4) {
+      configuredCapcodeInd = tokens[2].toInt();
+      configuredCapcodeGrp = tokens[3].toInt();
+      capGrpWasExplicitlySet = true;
+      saveSettings();
+      queueStatus("STATUS CAPS CAPIND=" + String(configuredCapcodeInd) +
+                  " CAPGRP=" + String(configuredCapcodeGrp));
       return;
     }
     if (key == "BAUD") {
@@ -944,7 +975,33 @@ void handleCommand(const std::vector<String> &tokens) {
       }
       message += tokens[i];
     }
-    enqueuePage(configuredCapcode, message, true);
+    enqueuePage(configuredCapcodeInd, message, true);
+    queueStatus("STATUS PAGE QUEUED");
+    return;
+  }
+
+  if (cmd == "PAGEI" && tokens.size() >= 2) {
+    String message;
+    for (size_t i = 1; i < tokens.size(); ++i) {
+      if (i > 1) {
+        message += " ";
+      }
+      message += tokens[i];
+    }
+    enqueuePage(configuredCapcodeInd, message, true);
+    queueStatus("STATUS PAGE QUEUED");
+    return;
+  }
+
+  if (cmd == "PAGEG" && tokens.size() >= 2) {
+    String message;
+    for (size_t i = 1; i < tokens.size(); ++i) {
+      if (i > 1) {
+        message += " ";
+      }
+      message += tokens[i];
+    }
+    enqueuePage(configuredCapcodeGrp, message, true);
     queueStatus("STATUS PAGE QUEUED");
     return;
   }
@@ -969,7 +1026,8 @@ void handleCommand(const std::vector<String> &tokens) {
   }
 
   if (cmd == "STATUS") {
-    String status = "STATUS CAPCODE=" + String(configuredCapcode) +
+    String status = "STATUS CAPIND=" + String(configuredCapcodeInd) +
+                    " CAPGRP=" + String(configuredCapcodeGrp) +
                     " BAUD=" + String(configuredBaud) +
                     " INVERT=" + String(configuredInvert ? 1 : 0) +
                     " DATA_GPIO=" + String(kDataGpio) +
@@ -1071,11 +1129,29 @@ void setup() {
   Serial.println("PagerBridge booting...");
 
   preferences.begin("pager", false);
-  configuredCapcode = preferences.getUInt("capcode", kDefaultCapcode);
+  bool hasCapInd = preferences.isKey("cap_ind");
+  bool hasCapGrp = preferences.isKey("cap_grp");
+  bool hasLegacyCap = preferences.isKey("capcode");
+  configuredCapcodeInd = preferences.getUInt("cap_ind", kDefaultCapcodeInd);
+  configuredCapcodeGrp = preferences.getUInt("cap_grp", kDefaultCapcodeGrp);
+  bool migratedLegacy = false;
+  if (hasLegacyCap && !hasCapInd && !hasCapGrp) {
+    uint32_t legacyCapcode = preferences.getUInt("capcode", kDefaultCapcodeInd);
+    configuredCapcodeInd = legacyCapcode;
+    if (configuredCapcodeInd == 0) {
+      configuredCapcodeGrp = kDefaultCapcodeGrp;
+    } else {
+      configuredCapcodeGrp = configuredCapcodeInd + 1;
+    }
+    migratedLegacy = true;
+  }
   configuredBaud = preferences.getUInt("baud", kDefaultBaud);
   configuredInvert = preferences.getBool("invert", kDefaultInvert);
   configuredAutoProbe = preferences.getBool("autoProbe", false);
   pageStore.load(preferences);
+  if (migratedLegacy) {
+    saveSettings();
+  }
 
   tx.begin(kDataGpio, configuredInvert, configuredBaud);
   probe.begin(kAlertGpio);
@@ -1106,7 +1182,8 @@ void setup() {
   Serial.println("BLE advertising started.");
   Serial.println("PagerBridge ready.");
   Serial.println("Settings:");
-  Serial.println("  CAPCODE=" + String(configuredCapcode));
+  Serial.println("  CAPIND=" + String(configuredCapcodeInd));
+  Serial.println("  CAPGRP=" + String(configuredCapcodeGrp));
   Serial.println("  BAUD=" + String(configuredBaud));
   Serial.println("  INVERT=" + String(configuredInvert ? 1 : 0));
   Serial.println("  DATA_GPIO=" + String(kDataGpio));
@@ -1115,7 +1192,10 @@ void setup() {
   queueStatus("READY");
   if (configuredAutoProbe) {
     std::vector<uint32_t> caps;
-    caps.push_back(configuredCapcode);
+    caps.push_back(configuredCapcodeInd);
+    if (configuredCapcodeGrp != configuredCapcodeInd) {
+      caps.push_back(configuredCapcodeGrp);
+    }
     probe.startOneshot(caps);
   }
 }
@@ -1148,7 +1228,10 @@ void loop() {
   if (probe.isActive()) {
     probe.update(
         [](uint32_t capcode) {
-          configuredCapcode = capcode;
+          configuredCapcodeInd = capcode;
+          if (!capGrpWasExplicitlySet) {
+            configuredCapcodeGrp = capcode + 1;
+          }
           saveSettings();
           pageStore.add(capcode, "PROBE_HIT capcode=" + String(capcode), millis(), "PROBE_HIT");
           saveSettings();
