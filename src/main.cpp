@@ -449,7 +449,7 @@ class PocsagTx {
 
   void idleLine() {
     // Open-drain emulation: release line (INPUT) for idle-high, drive LOW otherwise.
-    bool idleHigh = !invert_;
+    bool idleHigh = true;   // release the line when idle
     if (idleHigh) {
       pinMode(dataPin_, INPUT);
     } else {
