@@ -72,6 +72,7 @@ enum class InjectionProfile : uint8_t {
 };
 
 extern OutputMode configuredOutputMode;
+extern bool configuredIdleHigh;
 
 bool send_min_page(InjectionProfile profile, uint32_t capcode, uint8_t functionBits,
                    uint32_t baud, bool invert, bool idleHigh, uint32_t preambleBits);
@@ -1660,7 +1661,7 @@ static bool configuredInvert = kDefaultInvert;
 OutputMode configuredOutputMode = OutputMode::kOpenDrain;
 static int configuredDataGpio = kDataGpio;
 static String configuredGpioList;
-static bool configuredIdleHigh = kDefaultIdleLineHigh;
+bool configuredIdleHigh = kDefaultIdleLineHigh;
 static bool configuredAutoProbe = false;
 static bool pendingStoredPage = false;
 static bool capGrpWasExplicitlySet = false;
