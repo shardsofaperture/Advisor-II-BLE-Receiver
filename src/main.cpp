@@ -61,6 +61,14 @@ enum class OutputMode : uint8_t { kOpenDrain = 0, kPushPull = 1 };
 
 constexpr OutputMode kDefaultOutputMode = OutputMode::kOpenDrain;
 
+enum class InjectionProfile : uint8_t {
+  kNrzSliced = 0,
+  kNrzPushPull = 1,
+  kManchester = 2,
+  kDiscrimAudioFsk = 3,
+  kSlicerEdgePulse = 4,
+};
+
 class PageStore {
  public:
   explicit PageStore(size_t capacity) : capacity_(capacity) {}
@@ -377,7 +385,8 @@ class PocsagEncoder {
   }
 
   uint32_t buildAddressWord(uint32_t capcode, uint8_t functionBits) const {
-    uint32_t address = (capcode / 2) / 8;
+    uint32_t ric = capcode / 2;
+    uint32_t address = ric / 8;
     uint32_t data = (address & 0x3FFFF) << 2;
     data |= (functionBits & 0x3);
     uint32_t cw = buildCodeword(0, data);
@@ -468,6 +477,8 @@ class PocsagTx {
     idleLine();
   }
 
+  void idle() { idleLine(); }
+
   bool isBusy() const { return sending_; }
 
   bool sendBits(std::vector<uint8_t> &&bits) {
@@ -527,12 +538,17 @@ class PocsagTx {
   }
 
   void applyLineLevel(bool level) {
-    if (level) {
-      pinMode(dataPin_, INPUT);
+    if (outputMode_ == OutputMode::kOpenDrain) {
+      if (level) {
+        pinMode(dataPin_, INPUT);
+        return;
+      }
+      pinMode(dataPin_, OUTPUT);
+      digitalWrite(dataPin_, LOW);
       return;
     }
     pinMode(dataPin_, OUTPUT);
-    digitalWrite(dataPin_, LOW);
+    digitalWrite(dataPin_, level ? HIGH : LOW);
   }
 
   uint32_t bitPeriodUs() const { return (1000000 + (baud_ / 2)) / baud_; }
@@ -551,6 +567,124 @@ class PocsagTx {
 };
 
 PocsagTx *PocsagTx::instance_ = nullptr;
+
+struct EncodedWaveform {
+  std::vector<uint8_t> bits;
+  uint32_t baud = 1200;
+};
+
+String injectionProfileName(InjectionProfile profile) {
+  switch (profile) {
+    case InjectionProfile::kNrzSliced:
+      return "NRZ_SLICED";
+    case InjectionProfile::kNrzPushPull:
+      return "NRZ_PUSH_PULL";
+    case InjectionProfile::kManchester:
+      return "MANCHESTER";
+    case InjectionProfile::kDiscrimAudioFsk:
+      return "DISCRIM_AUDIO_FSK";
+    case InjectionProfile::kSlicerEdgePulse:
+      return "SLICER_EDGE_PULSE";
+  }
+  return "UNKNOWN";
+}
+
+void appendWordBits(std::vector<uint8_t> &bits, uint32_t word) {
+  for (int i = 31; i >= 0; --i) {
+    bits.push_back(static_cast<uint8_t>((word >> i) & 0x1));
+  }
+}
+
+std::vector<uint8_t> buildMinimalNrzBits(const PocsagEncoder &encoder, uint32_t capcode,
+                                         uint8_t functionBits, uint32_t preambleBits) {
+  std::vector<uint8_t> bits;
+  bits.reserve(preambleBits + (1 + 16) * 32);
+  for (uint32_t i = 0; i < preambleBits; ++i) {
+    bits.push_back(static_cast<uint8_t>((i % 2) == 0));
+  }
+  std::vector<uint32_t> batch = encoder.buildSingleBatchCodewords(capcode, functionBits, nullptr);
+  for (uint32_t word : batch) {
+    appendWordBits(bits, word);
+  }
+  return bits;
+}
+
+EncodedWaveform encodeManchester(const std::vector<uint8_t> &nrzBits, uint32_t baud) {
+  EncodedWaveform waveform;
+  waveform.bits.reserve(nrzBits.size() * 2);
+  for (uint8_t bit : nrzBits) {
+    if (bit) {
+      waveform.bits.push_back(1);
+      waveform.bits.push_back(0);
+    } else {
+      waveform.bits.push_back(0);
+      waveform.bits.push_back(1);
+    }
+  }
+  waveform.baud = baud * 2;
+  return waveform;
+}
+
+EncodedWaveform encodeDiscrimAudioFsk(const std::vector<uint8_t> &nrzBits, uint32_t baud) {
+  constexpr uint32_t kFskTickUs = 50;
+  EncodedWaveform waveform;
+  uint32_t bitPeriodUs = (1000000 + (baud / 2)) / baud;
+  uint32_t ticksPerBit = std::max<uint32_t>(1, (bitPeriodUs + (kFskTickUs / 2)) / kFskTickUs);
+  waveform.bits.reserve(nrzBits.size() * ticksPerBit);
+  for (uint8_t bit : nrzBits) {
+    uint32_t freq = bit ? 1200 : 2200;
+    uint32_t halfPeriodUs = (1000000 + (freq)) / (freq * 2);
+    uint32_t ticksPerHalf =
+        std::max<uint32_t>(1, (halfPeriodUs + (kFskTickUs / 2)) / kFskTickUs);
+    bool level = true;
+    uint32_t tickCount = 0;
+    for (uint32_t tick = 0; tick < ticksPerBit; ++tick) {
+      waveform.bits.push_back(level ? 1 : 0);
+      ++tickCount;
+      if (tickCount >= ticksPerHalf) {
+        tickCount = 0;
+        level = !level;
+      }
+    }
+  }
+  waveform.baud = 1000000 / kFskTickUs;
+  return waveform;
+}
+
+EncodedWaveform encodeSlicerEdgePulse(const std::vector<uint8_t> &nrzBits, uint32_t baud,
+                                      bool idleHigh) {
+  constexpr uint32_t kPulseUs = 100;
+  constexpr uint32_t kPulseTickUs = 50;
+  EncodedWaveform waveform;
+  uint32_t bitPeriodUs = (1000000 + (baud / 2)) / baud;
+  uint32_t ticksPerBit =
+      std::max<uint32_t>(1, (bitPeriodUs + (kPulseTickUs / 2)) / kPulseTickUs);
+  uint32_t pulseTicks =
+      std::min<uint32_t>(ticksPerBit,
+                         std::max<uint32_t>(1, (kPulseUs + (kPulseTickUs / 2)) / kPulseTickUs));
+  waveform.bits.reserve(nrzBits.size() * ticksPerBit);
+  uint8_t baseline = idleHigh ? 1 : 0;
+  uint8_t pulseLevel = baseline ? 0 : 1;
+  uint8_t previous = nrzBits.empty() ? 0 : nrzBits.front();
+  for (uint8_t bit : nrzBits) {
+    bool transition = bit != previous;
+    if (transition) {
+      for (uint32_t i = 0; i < pulseTicks; ++i) {
+        waveform.bits.push_back(pulseLevel);
+      }
+      for (uint32_t i = pulseTicks; i < ticksPerBit; ++i) {
+        waveform.bits.push_back(baseline);
+      }
+    } else {
+      for (uint32_t i = 0; i < ticksPerBit; ++i) {
+        waveform.bits.push_back(baseline);
+      }
+    }
+    previous = bit;
+  }
+  waveform.baud = 1000000 / kPulseTickUs;
+  return waveform;
+}
 
 struct TxRequest {
   uint32_t capcode = 0;
@@ -882,12 +1016,6 @@ class AutotestController {
     }
   }
 
-  void appendWordBits(std::vector<uint8_t> &bits, uint32_t word) const {
-    for (int i = 31; i >= 0; --i) {
-      bits.push_back(static_cast<uint8_t>((word >> i) & 0x1));
-    }
-  }
-
   std::vector<uint8_t> buildAutotestBits(const AutotestSettings &settings) const {
     std::vector<uint8_t> bits;
     bits.reserve(settings.preambleBits + (1 + 16) * 32);
@@ -940,6 +1068,189 @@ constexpr uint32_t AutotestController::kBauds[];
 constexpr bool AutotestController::kInverts[];
 constexpr bool AutotestController::kIdleHighs[];
 constexpr uint32_t AutotestController::kPreambles[];
+
+class Autotest2Controller {
+ public:
+  explicit Autotest2Controller(PocsagTx &tx) : tx_(tx) {}
+
+  void start(uint32_t capcode, uint32_t durationSeconds, uint32_t savedBaud,
+             bool savedInvert, bool savedIdleHigh, OutputMode savedOutputMode,
+             int savedGpio, const String &gpioList) {
+    capcode_ = capcode;
+    endTimeMs_ = millis() + durationSeconds * 1000;
+    attempt_ = 0;
+    baudIndex_ = 0;
+    invertIndex_ = 0;
+    idleIndex_ = 0;
+    functionIndex_ = 0;
+    preambleIndex_ = 0;
+    profileIndex_ = 0;
+    gpioIndex_ = 0;
+    stopRequested_ = false;
+    active_ = true;
+    nextAllowedMs_ = 0;
+    savedBaud_ = savedBaud;
+    savedInvert_ = savedInvert;
+    savedIdleHigh_ = savedIdleHigh;
+    savedOutputMode_ = savedOutputMode;
+    savedGpio_ = savedGpio;
+    gpioList_ = parseGpioList(gpioList);
+    if (gpioList_.empty()) {
+      gpioList_.push_back(savedGpio_);
+    }
+    currentGpio_ = -1;
+  }
+
+  void requestStop() { stopRequested_ = true; }
+
+  bool isActive() const { return active_; }
+
+  void update() {
+    if (!active_) {
+      return;
+    }
+    if (tx_.isBusy()) {
+      return;
+    }
+    if (stopRequested_ || millis() >= endTimeMs_) {
+      finish(stopRequested_ ? "STATUS AUTOTEST2 STOPPED" : "STATUS AUTOTEST2 DONE");
+      return;
+    }
+    if (millis() < nextAllowedMs_) {
+      return;
+    }
+    AutotestSettings settings = currentSettings();
+    ++attempt_;
+    queueStatus(buildAttemptLine(settings));
+    if (settings.gpio != currentGpio_) {
+      currentGpio_ = settings.gpio;
+      tx_.begin(currentGpio_, settings.invert, settings.baud, configuredOutputMode,
+                settings.idleHigh);
+    }
+    if (!send_min_page(settings.profile, capcode_, settings.functionBits, settings.baud,
+                       settings.invert, settings.idleHigh, settings.preambleBits)) {
+      queueStatus("ERROR AUTOTEST2 TX_BUSY");
+      return;
+    }
+    nextAllowedMs_ = millis() + kAutotestGapMs;
+    advance();
+  }
+
+ private:
+  struct AutotestSettings {
+    InjectionProfile profile = InjectionProfile::kNrzSliced;
+    uint32_t baud = 512;
+    bool invert = false;
+    bool idleHigh = true;
+    uint8_t functionBits = 0;
+    uint32_t preambleBits = 576;
+    int gpio = -1;
+  };
+
+  static constexpr uint32_t kBauds[] = {512, 1200, 2400};
+  static constexpr bool kInverts[] = {false, true};
+  static constexpr bool kIdleHighs[] = {true, false};
+  static constexpr uint32_t kPreambles[] = {576, 1152, 2304};
+  static constexpr InjectionProfile kProfiles[] = {
+      InjectionProfile::kNrzSliced, InjectionProfile::kNrzPushPull,
+      InjectionProfile::kManchester, InjectionProfile::kDiscrimAudioFsk,
+      InjectionProfile::kSlicerEdgePulse};
+  static constexpr size_t kBaudCount = sizeof(kBauds) / sizeof(kBauds[0]);
+  static constexpr size_t kInvertCount = sizeof(kInverts) / sizeof(kInverts[0]);
+  static constexpr size_t kIdleHighCount = sizeof(kIdleHighs) / sizeof(kIdleHighs[0]);
+  static constexpr size_t kPreambleCount = sizeof(kPreambles) / sizeof(kPreambles[0]);
+  static constexpr size_t kProfileCount = sizeof(kProfiles) / sizeof(kProfiles[0]);
+  static constexpr uint32_t kAutotestGapMs = 350;
+
+  AutotestSettings currentSettings() const {
+    AutotestSettings settings;
+    settings.profile = kProfiles[profileIndex_];
+    settings.baud = kBauds[baudIndex_];
+    settings.invert = kInverts[invertIndex_];
+    settings.idleHigh = kIdleHighs[idleIndex_];
+    settings.functionBits = static_cast<uint8_t>(functionIndex_);
+    settings.preambleBits = kPreambles[preambleIndex_];
+    settings.gpio = gpioList_[gpioIndex_];
+    return settings;
+  }
+
+  String buildAttemptLine(const AutotestSettings &settings) const {
+    String line = "AUTOTEST2 #" + String(attempt_) + " GPIO=" + String(settings.gpio) +
+                  " PROFILE=" + injectionProfileName(settings.profile) +
+                  " BAUD=" + String(settings.baud) +
+                  " INVERT=" + String(settings.invert ? 1 : 0) +
+                  " IDLE=" + String(settings.idleHigh ? 1 : 0) +
+                  " FUNC=" + String(settings.functionBits) +
+                  " PREAMBLE=" + String(settings.preambleBits);
+    return line;
+  }
+
+  void advance() {
+    ++preambleIndex_;
+    if (preambleIndex_ >= kPreambleCount) {
+      preambleIndex_ = 0;
+      ++functionIndex_;
+      if (functionIndex_ >= 4) {
+        functionIndex_ = 0;
+        ++idleIndex_;
+        if (idleIndex_ >= kIdleHighCount) {
+          idleIndex_ = 0;
+          ++invertIndex_;
+          if (invertIndex_ >= kInvertCount) {
+            invertIndex_ = 0;
+            ++baudIndex_;
+            if (baudIndex_ >= kBaudCount) {
+              baudIndex_ = 0;
+              ++profileIndex_;
+              if (profileIndex_ >= kProfileCount) {
+                profileIndex_ = 0;
+                ++gpioIndex_;
+                if (gpioIndex_ >= gpioList_.size()) {
+                  gpioIndex_ = 0;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  void finish(const String &status) {
+    active_ = false;
+    stopRequested_ = false;
+    tx_.begin(savedGpio_, savedInvert_, savedBaud_, savedOutputMode_, savedIdleHigh_);
+    queueStatus(status);
+  }
+
+  PocsagTx &tx_;
+  bool active_ = false;
+  bool stopRequested_ = false;
+  uint32_t capcode_ = 0;
+  uint32_t endTimeMs_ = 0;
+  size_t attempt_ = 0;
+  size_t baudIndex_ = 0;
+  size_t invertIndex_ = 0;
+  size_t idleIndex_ = 0;
+  size_t functionIndex_ = 0;
+  size_t preambleIndex_ = 0;
+  size_t profileIndex_ = 0;
+  size_t gpioIndex_ = 0;
+  uint32_t nextAllowedMs_ = 0;
+  uint32_t savedBaud_ = kDefaultBaud;
+  bool savedInvert_ = kDefaultInvert;
+  bool savedIdleHigh_ = kDefaultIdleLineHigh;
+  OutputMode savedOutputMode_ = kDefaultOutputMode;
+  int savedGpio_ = kDataGpio;
+  int currentGpio_ = -1;
+  std::vector<int> gpioList_;
+};
+
+constexpr uint32_t Autotest2Controller::kBauds[];
+constexpr bool Autotest2Controller::kInverts[];
+constexpr bool Autotest2Controller::kIdleHighs[];
+constexpr uint32_t Autotest2Controller::kPreambles[];
+constexpr InjectionProfile Autotest2Controller::kProfiles[];
 
 class CommandParser {
  public:
@@ -1085,6 +1396,7 @@ static PocsagTx tx;
 static PageStore pageStore(kPageStoreCapacity);
 static ProbeController probe(tx, encoder);
 static AutotestController autotest(tx, encoder);
+static Autotest2Controller autotest2(tx);
 static CommandParser parser;
 
 static std::deque<TxRequest> txQueue;
@@ -1094,6 +1406,7 @@ static uint32_t configuredBaud = kDefaultBaud;
 static bool configuredInvert = kDefaultInvert;
 static OutputMode configuredOutputMode = OutputMode::kOpenDrain;
 static int configuredDataGpio = kDataGpio;
+static String configuredGpioList;
 static bool configuredIdleHigh = kDefaultIdleLineHigh;
 static bool configuredAutoProbe = false;
 static bool pendingStoredPage = false;
@@ -1120,6 +1433,7 @@ void saveSettings() {
   preferences.putBool("invert", configuredInvert);
   preferences.putUChar("output", static_cast<uint8_t>(configuredOutputMode));
   preferences.putInt("dataGpio", configuredDataGpio);
+  preferences.putString("gpioList", configuredGpioList);
   preferences.putBool("idleHigh", configuredIdleHigh);
   preferences.putBool("autoProbe", configuredAutoProbe);
   pageStore.persist(preferences);
@@ -1188,6 +1502,41 @@ std::vector<uint8_t> buildTestPattern(uint32_t capcode, uint8_t functionBits,
   return bits;
 }
 
+bool send_min_page(InjectionProfile profile, uint32_t capcode, uint8_t functionBits,
+                   uint32_t baud, bool invert, bool idleHigh, uint32_t preambleBits) {
+  std::vector<uint8_t> nrzBits =
+      buildMinimalNrzBits(encoder, capcode, functionBits, preambleBits);
+  EncodedWaveform waveform;
+  switch (profile) {
+    case InjectionProfile::kNrzSliced:
+    case InjectionProfile::kNrzPushPull:
+      waveform.bits = std::move(nrzBits);
+      waveform.baud = baud;
+      break;
+    case InjectionProfile::kManchester:
+      waveform = encodeManchester(nrzBits, baud);
+      break;
+    case InjectionProfile::kDiscrimAudioFsk:
+      waveform = encodeDiscrimAudioFsk(nrzBits, baud);
+      break;
+    case InjectionProfile::kSlicerEdgePulse:
+      waveform = encodeSlicerEdgePulse(nrzBits, baud, idleHigh);
+      break;
+  }
+  if (waveform.bits.empty()) {
+    return false;
+  }
+  OutputMode outputMode = configuredOutputMode;
+  if (profile == InjectionProfile::kNrzPushPull) {
+    outputMode = OutputMode::kPushPull;
+  }
+  tx.setOutputMode(outputMode);
+  tx.setInvert(invert);
+  tx.setIdleHigh(idleHigh);
+  tx.setBaud(waveform.baud);
+  return tx.sendBits(std::move(waveform.bits));
+}
+
 String buildStatusLine() {
   String status = "STATUS CAPIND=" + String(configuredCapcodeInd) +
                   " CAPGRP=" + String(configuredCapcodeGrp) +
@@ -1198,6 +1547,9 @@ String buildStatusLine() {
                   String(configuredOutputMode == OutputMode::kPushPull ? "PUSH_PULL"
                                                                        : "OPEN_DRAIN") +
                   " DATA_GPIO=" + String(configuredDataGpio) +
+                  (configuredGpioList.length() > 0
+                       ? " GPIO_LIST=" + configuredGpioList
+                       : "") +
                   " ALERT_GPIO=" + String(kAlertGpio) +
                   " AUTOPROBE=" + String(configuredAutoProbe ? 1 : 0) +
                   " PAGES=" + String(pageStore.size());
@@ -1227,6 +1579,38 @@ bool parseFunctionBits(const String &value, uint8_t &out) {
 }
 
 bool isValidRate(uint32_t rate) { return rate == 512 || rate == 1200 || rate == 2400; }
+
+std::vector<int> parseGpioList(const String &value) {
+  std::vector<int> pins;
+  int start = 0;
+  while (start < value.length()) {
+    int comma = value.indexOf(',', start);
+    if (comma < 0) {
+      comma = value.length();
+    }
+    String token = value.substring(start, comma);
+    token.trim();
+    if (token.length() > 0) {
+      uint32_t pin = 0;
+      if (parseUint32(token, pin)) {
+        pins.push_back(static_cast<int>(pin));
+      }
+    }
+    start = comma + 1;
+  }
+  return pins;
+}
+
+String normalizeGpioList(const std::vector<int> &pins) {
+  String value;
+  for (size_t i = 0; i < pins.size(); ++i) {
+    if (i > 0) {
+      value += ",";
+    }
+    value += String(pins[i]);
+  }
+  return value;
+}
 
 void handleCommand(const std::vector<String> &tokens) {
   if (tokens.empty()) {
@@ -1295,6 +1679,21 @@ void handleCommand(const std::vector<String> &tokens) {
     queueStatus(buildStatusLine());
     return;
   }
+  if (cmd == "SET_GPIO_LIST" && tokens.size() >= 2) {
+    String listValue = tokens[1];
+    for (size_t i = 2; i < tokens.size(); ++i) {
+      listValue += tokens[i];
+    }
+    std::vector<int> pins = parseGpioList(listValue);
+    if (pins.empty()) {
+      queueStatus("ERROR GPIO_LIST INVALID");
+      return;
+    }
+    configuredGpioList = normalizeGpioList(pins);
+    saveSettings();
+    queueStatus("STATUS GPIO_LIST=" + configuredGpioList);
+    return;
+  }
   if (cmd == "SEND_TEST") {
     std::vector<uint8_t> bits = buildTestPattern(configuredCapcodeInd, 0, "TEST");
     enqueueRawBits(std::move(bits), "TEST_PATTERN");
@@ -1314,12 +1713,16 @@ void handleCommand(const std::vector<String> &tokens) {
       queueStatus("ERROR SEND_MIN INVALID");
       return;
     }
-    std::vector<uint8_t> bits = buildAlternatingBitsForBaud(2000, 512);
-    std::vector<uint32_t> batch = encoder.buildSingleBatchCodewords(capcode, functionBits, nullptr);
-    std::vector<uint8_t> batchBits = encoder.buildBitstreamFromCodewords(batch, false);
-    bits.insert(bits.end(), batchBits.begin(), batchBits.end());
-    enqueueRawBits(std::move(bits), "MIN_PAGE");
-    queueStatus("STATUS MIN QUEUED");
+    if (tx.isBusy()) {
+      queueStatus("ERROR SEND_MIN TX_BUSY");
+      return;
+    }
+    if (!send_min_page(InjectionProfile::kNrzSliced, capcode, functionBits, configuredBaud,
+                       configuredInvert, configuredIdleHigh, kPreambleBits)) {
+      queueStatus("ERROR SEND_MIN TX_BUSY");
+      return;
+    }
+    queueStatus("STATUS MIN START");
     return;
   }
   if (cmd == "SEND_SYNC") {
@@ -1369,6 +1772,52 @@ void handleCommand(const std::vector<String> &tokens) {
     autotest.start(capcode, durationSeconds, configuredBaud, configuredInvert,
                    configuredIdleHigh);
     queueStatus("STATUS AUTOTEST START");
+    return;
+  }
+  if (cmd == "AUTOTEST2" && tokens.size() >= 2) {
+    String value = tokens[1];
+    value.toUpperCase();
+    if (value == "STOP") {
+      if (!autotest2.isActive()) {
+        queueStatus("ERROR AUTOTEST2 NOT_ACTIVE");
+        return;
+      }
+      autotest2.requestStop();
+      if (!tx.isBusy()) {
+        autotest2.update();
+      }
+      return;
+    }
+    uint32_t capcode = 0;
+    if (!parseUint32(tokens[1], capcode)) {
+      queueStatus("ERROR AUTOTEST2 INVALID");
+      return;
+    }
+    uint32_t durationSeconds = 60;
+    if (tokens.size() >= 3) {
+      if (!parseUint32(tokens[2], durationSeconds) || durationSeconds == 0) {
+        queueStatus("ERROR AUTOTEST2 DURATION");
+        return;
+      }
+    }
+    if (autotest2.isActive()) {
+      queueStatus("ERROR AUTOTEST2 BUSY");
+      return;
+    }
+    if (autotest.isActive()) {
+      queueStatus("ERROR AUTOTEST BUSY");
+      return;
+    }
+    if (tx.isBusy()) {
+      queueStatus("ERROR AUTOTEST2 TX_BUSY");
+      return;
+    }
+    if (probe.isActive()) {
+      probe.stop();
+    }
+    autotest2.start(capcode, durationSeconds, configuredBaud, configuredInvert, configuredIdleHigh,
+                    configuredOutputMode, configuredDataGpio, configuredGpioList);
+    queueStatus("STATUS AUTOTEST2 START");
     return;
   }
   if (cmd == "SEND_ADDR" && tokens.size() >= 3) {
@@ -1722,6 +2171,7 @@ void setup() {
   configuredDataGpio =
       hasDataGpio ? preferences.getInt("dataGpio", kDataGpio)
                   : preferences.getInt("data_gpio", kDataGpio);
+  configuredGpioList = preferences.getString("gpioList", "");
   configuredIdleHigh =
       hasIdleHigh ? preferences.getBool("idleHigh", kDefaultIdleLineHigh)
                   : preferences.getBool("idle_high", kDefaultIdleLineHigh);
@@ -1793,7 +2243,9 @@ void loop() {
     }
   }
 
-  if (autotest.isActive()) {
+  if (autotest2.isActive()) {
+    autotest2.update();
+  } else if (autotest.isActive()) {
     autotest.update();
   } else {
     if (!tx.isBusy() && !txQueue.empty() && !probe.isActive()) {

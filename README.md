@@ -52,6 +52,26 @@ When the RF board is installed for battery-save wake, keep the RF hardware prese
   ```
 - `TEST CARRIER` is **only for scope timing** (not for alerting).
 
+## No RF service bring-up
+On some logic board revisions, **TSP2 may not accept raw sliced NRZ** or the node may be gated/conditioned. If AUTOTEST never decodes, move the injection wire to other test pads and brute-force different signal styles.
+
+### Injection profiles (signal styles)
+- **NRZ_SLICED**: raw NRZ bits at the baud rate. Intended for **post-slicer digital nodes** (TSP2).
+- **NRZ_PUSH_PULL**: raw NRZ, but push-pull drive for CMOS-style inputs.
+- **MANCHESTER**: bi-phase level (each bit is high→low or low→high at half-bit rate).
+- **DISCRIM_AUDIO_FSK**: square-wave approximation of discriminator audio (1200/2200 Hz per bit). Intended for **discriminator/analog/slicer-input** nodes.
+- **SLICER_EDGE_PULSE**: emit a short low pulse on each NRZ transition. Intended for **AC-coupled nodes**.
+
+### Multi-pin brute force
+Set a list of candidate GPIOs so you can move the injection wire without changing commands:
+```
+SET_GPIO_LIST 3,4
+AUTOTEST2 123456 120
+```
+
+Notes:
+- **123456 and 123457 share the same POCSAG address** because addressing is based on **capcode / 2**. The function bits differentiate them.
+
 ## Build & flash (PlatformIO)
 1. Install **PlatformIO** in VS Code.
 2. Open this repo in VS Code.
@@ -126,6 +146,12 @@ SET OUTPUT PUSH_PULL
 Change the DATA GPIO (re-initializes the transmitter).
 ```
 SET_GPIO 3
+```
+
+### SET_GPIO_LIST <pin1,pin2,...>
+Store a list of candidate DATA GPIOs for AUTOTEST2 (used when moving the injection wire).
+```
+SET_GPIO_LIST 3,4
 ```
 
 ### SET_IDLE <0|1>
@@ -229,6 +255,25 @@ Notes:
   target the same address; the function bits differentiate them.
 - AUTOTEST tries baud **512/1200/2400**, invert **0/1**, idle **1/0**, function **0-3**,
   and preamble lengths **576/1152/2304**.
+
+### AUTOTEST2 <capcode> [seconds]
+Sweeps **profiles + baud + invert + idle + function + preamble** and iterates across GPIOs in the
+`SET_GPIO_LIST` list (or the single configured GPIO if unset).
+```
+AUTOTEST2 123456 120
+```
+Profiles tested:
+- `NRZ_SLICED`
+- `NRZ_PUSH_PULL`
+- `MANCHESTER`
+- `DISCRIM_AUDIO_FSK`
+- `SLICER_EDGE_PULSE`
+
+### AUTOTEST2 STOP
+Stop a running AUTOTEST2 early.
+```
+AUTOTEST2 STOP
+```
 
 ### AUTOTEST STOP
 Stop a running AUTOTEST early.
