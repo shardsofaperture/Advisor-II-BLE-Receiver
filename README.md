@@ -38,6 +38,7 @@ If you want PROBE auto-detect to work, wire the pager’s alert indication to **
 2. Run `DEBUG_SCOPE` on the DATA pin to confirm 512 bps timing.
 3. Run `AUTOTEST_FAST 60` to sweep invert/function/preamble.
 4. Lock the winning combo once the pager alerts.
+5. Use `SEND_MIN_LOOP` first for deterministic, no-sweep testing.
 
 ## Bring-up checklist (known: POCSAG, 512 bps, capcode 123456)
 **Known values**
@@ -53,6 +54,7 @@ If you want PROBE auto-detect to work, wire the pager’s alert indication to **
 1. Run `DEBUG_SCOPE` at 512 on the RF DATA pin.
 2. Run `AUTOTEST_FAST 60` while monitoring for an alert.
 3. If any beep/alert is observed, lock that combo and use `SEND_MIN_LOOP` for longer.
+4. If you need brute-force sweeps across pins/profiles, use `AUTOTEST2` (now dwells per combo).
 
 ## No RF service bring-up
 If AUTOTEST never decodes, confirm the wiring is on the **RF board DATA pin** and the line is **open-collector**. Other pads (TA31142, discriminator audio, TSP) are not valid for raw NRZ injection.
@@ -70,6 +72,9 @@ Set a list of candidate GPIOs so you can move the injection wire without changin
 SET_GPIO_LIST 3,4
 AUTOTEST2 123456 120
 ```
+Notes:
+- `AUTOTEST2` now **dwells per combo** and repeats the minimal page for a few seconds.
+- For `NRZ_SLICED`, `AUTOTEST2` keeps **IDLE=1** (no idle sweep for that profile).
 
 Notes:
 - **123456 and 123457 share the same POCSAG address** because addressing is based on **capcode / 2**. The function bits differentiate them.
@@ -196,6 +201,13 @@ PAGE 0123457 Hello
 Transmit a repeating 0xAA pattern for wiring verification (uses current BAUD/output/invert).
 ```
 TEST CARRIER 3000
+```
+
+### SEND_MIN_LOOP <capcode> <func> <seconds> [preamble_ms]
+Repeat a minimal page continuously for the specified timeout (no sweep). Uses current OUTPUT.
+```
+SEND_MIN_LOOP 123456 0 30
+SEND_MIN_LOOP 123456 0 30 1125
 ```
 
 ### SET_RATE <512|1200|2400>

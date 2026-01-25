@@ -1332,7 +1332,10 @@ class Autotest2Controller {
     gpioIndex_ = 0;
     stopRequested_ = false;
     active_ = true;
-    nextAllowedMs_ = 0;
+    dwellActive_ = false;
+    dwellStartMs_ = 0;
+    nextSendMs_ = 0;
+    lastYieldMs_ = millis();
     savedBaud_ = savedBaud;
     savedInvert_ = savedInvert;
     savedIdleHigh_ = savedIdleHigh;
@@ -1353,31 +1356,33 @@ class Autotest2Controller {
     if (!active_) {
       return;
     }
-    if (tx_.isBusy()) {
-      return;
-    }
+    maybeYield();
     if (stopRequested_ || millis() >= endTimeMs_) {
       finish(stopRequested_ ? "STATUS AUTOTEST2 STOPPED" : "STATUS AUTOTEST2 DONE");
       return;
     }
-    if (millis() < nextAllowedMs_) {
+    if (tx_.isBusy()) {
       return;
     }
-    AutotestSettings settings = currentSettings();
-    ++attempt_;
-    queueStatus(buildAttemptLine(settings));
-    if (settings.gpio != currentGpio_) {
-      currentGpio_ = settings.gpio;
-      tx_.begin(currentGpio_, settings.invert, settings.baud, configuredOutputMode,
-                settings.idleHigh);
+    uint32_t now = millis();
+    if (!dwellActive_) {
+      startCase(now);
     }
-    if (!send_min_page(settings.profile, capcode_, settings.functionBits, settings.baud,
-                       settings.invert, settings.idleHigh, settings.preambleBits)) {
+    if (now - dwellStartMs_ >= kAutotestDwellMs) {
+      dwellActive_ = false;
+      advance();
+      return;
+    }
+    if (now < nextSendMs_) {
+      return;
+    }
+    if (!send_min_page(activeSettings_.profile, capcode_, activeSettings_.functionBits,
+                       activeSettings_.baud, activeSettings_.invert, activeSettings_.idleHigh,
+                       activeSettings_.preambleBits)) {
       queueStatus("ERROR AUTOTEST2 TX_BUSY");
       return;
     }
-    nextAllowedMs_ = millis() + kAutotestGapMs;
-    advance();
+    nextSendMs_ = now + random(kAutotestGapMinMs, kAutotestGapMaxMs + 1);
   }
 
  private:
@@ -1404,14 +1409,19 @@ class Autotest2Controller {
   static constexpr size_t kIdleHighCount = sizeof(kIdleHighs) / sizeof(kIdleHighs[0]);
   static constexpr size_t kPreambleCount = sizeof(kPreambles) / sizeof(kPreambles[0]);
   static constexpr size_t kProfileCount = sizeof(kProfiles) / sizeof(kProfiles[0]);
-  static constexpr uint32_t kAutotestGapMs = 350;
+  static constexpr uint32_t kAutotestDwellMs = 3000;
+  static constexpr uint32_t kAutotestGapMinMs = 50;
+  static constexpr uint32_t kAutotestGapMaxMs = 150;
+  static constexpr uint32_t kAutotestYieldMs = 10;
 
   AutotestSettings currentSettings() const {
     AutotestSettings settings;
     settings.profile = kProfiles[profileIndex_];
     settings.baud = kBauds[baudIndex_];
     settings.invert = kInverts[invertIndex_];
-    settings.idleHigh = kIdleHighs[idleIndex_];
+    settings.idleHigh = settings.profile == InjectionProfile::kNrzSliced
+                            ? true
+                            : kIdleHighs[idleIndex_];
     settings.functionBits = static_cast<uint8_t>(functionIndex_);
     settings.preambleBits = kPreambles[preambleIndex_];
     settings.gpio = gpioList_[gpioIndex_];
@@ -1436,27 +1446,55 @@ class Autotest2Controller {
       ++functionIndex_;
       if (functionIndex_ >= 4) {
         functionIndex_ = 0;
-        ++idleIndex_;
-        if (idleIndex_ >= kIdleHighCount) {
+        const bool sweepIdle = kProfiles[profileIndex_] != InjectionProfile::kNrzSliced;
+        if (sweepIdle) {
+          ++idleIndex_;
+          if (idleIndex_ < kIdleHighCount) {
+            return;
+          }
           idleIndex_ = 0;
-          ++invertIndex_;
-          if (invertIndex_ >= kInvertCount) {
-            invertIndex_ = 0;
-            ++baudIndex_;
-            if (baudIndex_ >= kBaudCount) {
-              baudIndex_ = 0;
-              ++profileIndex_;
-              if (profileIndex_ >= kProfileCount) {
-                profileIndex_ = 0;
-                ++gpioIndex_;
-                if (gpioIndex_ >= gpioList_.size()) {
-                  gpioIndex_ = 0;
-                }
+        } else {
+          idleIndex_ = 0;
+        }
+        ++invertIndex_;
+        if (invertIndex_ >= kInvertCount) {
+          invertIndex_ = 0;
+          ++baudIndex_;
+          if (baudIndex_ >= kBaudCount) {
+            baudIndex_ = 0;
+            ++profileIndex_;
+            if (profileIndex_ >= kProfileCount) {
+              profileIndex_ = 0;
+              ++gpioIndex_;
+              if (gpioIndex_ >= gpioList_.size()) {
+                gpioIndex_ = 0;
               }
             }
           }
         }
       }
+    }
+  }
+
+  void startCase(uint32_t nowMs) {
+    activeSettings_ = currentSettings();
+    ++attempt_;
+    queueStatus(buildAttemptLine(activeSettings_));
+    if (activeSettings_.gpio != currentGpio_) {
+      currentGpio_ = activeSettings_.gpio;
+      tx_.begin(currentGpio_, activeSettings_.invert, activeSettings_.baud,
+                configuredOutputMode, activeSettings_.idleHigh);
+    }
+    dwellStartMs_ = nowMs;
+    nextSendMs_ = nowMs;
+    dwellActive_ = true;
+  }
+
+  void maybeYield() {
+    uint32_t now = millis();
+    if (now - lastYieldMs_ >= kAutotestYieldMs) {
+      lastYieldMs_ = now;
+      vTaskDelay(1);
     }
   }
 
@@ -1480,7 +1518,11 @@ class Autotest2Controller {
   size_t preambleIndex_ = 0;
   size_t profileIndex_ = 0;
   size_t gpioIndex_ = 0;
-  uint32_t nextAllowedMs_ = 0;
+  bool dwellActive_ = false;
+  AutotestSettings activeSettings_;
+  uint32_t dwellStartMs_ = 0;
+  uint32_t nextSendMs_ = 0;
+  uint32_t lastYieldMs_ = 0;
   uint32_t savedBaud_ = kDefaultBaud;
   bool savedInvert_ = kDefaultInvert;
   bool savedIdleHigh_ = kDefaultIdleLineHigh;
@@ -1890,7 +1932,39 @@ void handleCommand(const std::vector<String> &tokens) {
   if (tokens.empty()) {
     return;
   }
-  String cmd = tokens[0];
+  std::vector<String> normalized = tokens;
+  auto splitAssignment = [](const String &token, String &key, String &value) {
+    int eq = token.indexOf('=');
+    if (eq <= 0) {
+      return false;
+    }
+    key = token.substring(0, eq);
+    value = token.substring(eq + 1);
+    return value.length() > 0;
+  };
+  String cmd = normalized[0];
+  cmd.toUpperCase();
+  String assignedKey;
+  String assignedValue;
+  if (cmd == "SET" && normalized.size() >= 2 &&
+      splitAssignment(normalized[1], assignedKey, assignedValue)) {
+    normalized[1] = assignedKey;
+    normalized.insert(normalized.begin() + 2, assignedValue);
+  } else if (splitAssignment(cmd, assignedKey, assignedValue)) {
+    normalized.clear();
+    normalized.push_back("SET");
+    normalized.push_back(assignedKey);
+    normalized.push_back(assignedValue);
+  } else if (cmd == "INVERT" || cmd == "IDLE" || cmd == "BAUD" || cmd == "OUTPUT" ||
+             cmd == "CAPCODE" || cmd == "CAPIND" || cmd == "CAPGRP" || cmd == "CAPS" ||
+             cmd == "AUTOPROBE") {
+    normalized.insert(normalized.begin(), "SET");
+  }
+  if (normalized != tokens) {
+    handleCommand(normalized);
+    return;
+  }
+  cmd = tokens[0];
   cmd.toUpperCase();
   if (cmd == "SET_RATE" && tokens.size() >= 2) {
     uint32_t rate = tokens[1].toInt();
@@ -2021,14 +2095,28 @@ void handleCommand(const std::vector<String> &tokens) {
                 " func=" + String(functionBits) + " preamble=" + String(preambleMs) + "ms");
     return;
   }
-  if (cmd == "SEND_MIN_LOOP" && tokens.size() >= 5) {
+  if (cmd == "SEND_MIN_LOOP" && tokens.size() >= 4) {
     uint32_t capcode = 0;
     uint8_t functionBits = 0;
-    uint32_t preambleMs = 0;
+    uint32_t preambleMs = configuredDefaultPreambleMs;
     uint32_t durationSeconds = 0;
-    if (!parseUint32(tokens[1], capcode) || !parseFunctionBits(tokens[2], functionBits) ||
-        !parseUint32(tokens[3], preambleMs) || preambleMs == 0 ||
-        !parseUint32(tokens[4], durationSeconds) || durationSeconds == 0) {
+    if (!parseUint32(tokens[1], capcode) || !parseFunctionBits(tokens[2], functionBits)) {
+      queueStatus("ERROR SEND_MIN_LOOP INVALID");
+      return;
+    }
+    if (tokens.size() >= 5) {
+      if (!parseUint32(tokens[3], preambleMs) || preambleMs == 0 ||
+          !parseUint32(tokens[4], durationSeconds) || durationSeconds == 0) {
+        queueStatus("ERROR SEND_MIN_LOOP INVALID");
+        return;
+      }
+    } else {
+      if (!parseUint32(tokens[3], durationSeconds) || durationSeconds == 0) {
+        queueStatus("ERROR SEND_MIN_LOOP INVALID");
+        return;
+      }
+    }
+    if (preambleMs == 0) {
       queueStatus("ERROR SEND_MIN_LOOP INVALID");
       return;
     }
