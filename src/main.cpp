@@ -15,8 +15,8 @@ constexpr const char *kDeviceName = "PagerBridge";
 // Compile-time configuration.
 constexpr int kDataGpio = 3; // D2 on XIAO ESP32-S3status
 constexpr int kAlertGpio = -1;
-constexpr uint32_t kDefaultCapcodeInd = 123456;
-constexpr uint32_t kDefaultCapcodeGrp = 123457;
+constexpr uint32_t kDefaultRicInd = 1234567;
+constexpr uint32_t kDefaultRicGrp = 1234568;
 constexpr uint32_t kDefaultBaud = 512;
 constexpr bool kDefaultInvert = false;
 constexpr bool kDefaultIdleLineHigh = true;
@@ -147,7 +147,7 @@ class PageStore {
     lines.reserve(pages_.size());
     size_t idx = 0;
     for (auto it = pages_.rbegin(); it != pages_.rend(); ++it, ++idx) {
-      String line = String("#") + idx + " cap=" + it->capcode + " result=" + it->lastResult +
+      String line = String("#") + idx + " ric=" + it->capcode + " result=" + it->lastResult +
                     " ms=" + it->timestampMs + " msg=\"" + it->message + "\"";
       lines.push_back(line);
     }
@@ -1009,7 +1009,7 @@ class AutotestController {
   }
 
   String buildAttemptLine(const AutotestSettings &settings) const {
-    String line = "AUTOTEST #" + String(attempt_) + " CAP=" + String(capcode_) +
+    String line = "AUTOTEST #" + String(attempt_) + " RIC=" + String(capcode_) +
                   " BAUD=" + String(settings.baud) +
                   " INVERT=" + String(settings.invert ? 1 : 0) +
                   " IDLE=" + String(settings.idleHigh ? 1 : 0) +
@@ -1100,7 +1100,7 @@ class AutotestFastController {
 
   void start(uint32_t durationSeconds, uint32_t savedBaud, bool savedInvert, bool savedIdleHigh,
              OutputMode savedOutputMode) {
-    capcode_ = kDefaultCapcodeInd;
+    capcode_ = kDefaultRicInd;
     startTimeMs_ = millis();
     endTimeMs_ = startTimeMs_ + durationSeconds * 1000;
     comboStartMs_ = 0;
@@ -1553,7 +1553,10 @@ class CommandParser {
       return "";
     }
     if (cmd == "PAGE") {
-      String cap = getJsonString(line, "capcode");
+      String cap = getJsonString(line, "ric");
+      if (cap.length() == 0) {
+        cap = getJsonString(line, "capcode");
+      }
       String text = getJsonString(line, "text");
       if (cap.length() > 0) {
         return cmd + " " + cap + " " + text;
@@ -1574,6 +1577,12 @@ class CommandParser {
         String start = getJsonString(line, "startCap");
         String end = getJsonString(line, "endCap");
         String step = getJsonString(line, "step");
+        if (start.length() == 0) {
+          start = getJsonString(line, "startRic");
+        }
+        if (end.length() == 0) {
+          end = getJsonString(line, "endRic");
+        }
         if (mode == "START" && step.length() > 0) {
           return cmd + " START " + start + " " + end + " " + step;
         }
@@ -1654,8 +1663,8 @@ static MinLoopController minLoop(tx);
 static CommandParser parser;
 
 static std::deque<TxRequest> txQueue;
-static uint32_t configuredCapcodeInd = kDefaultCapcodeInd;
-static uint32_t configuredCapcodeGrp = kDefaultCapcodeGrp;
+static uint32_t configuredCapcodeInd = kDefaultRicInd;
+static uint32_t configuredCapcodeGrp = kDefaultRicGrp;
 static uint32_t configuredBaud = kDefaultBaud;
 static bool configuredInvert = kDefaultInvert;
 OutputMode configuredOutputMode = OutputMode::kOpenDrain;
@@ -1816,9 +1825,10 @@ bool send_min_page(uint32_t capcode, uint8_t functionBits, uint32_t preambleMs) 
 }
 
 String buildStatusLine() {
-  String status = "STATUS CAPCODE=" + String(configuredCapcodeInd) +
-                  " CAPIND=" + String(configuredCapcodeInd) +
-                  " CAPGRP=" + String(configuredCapcodeGrp) +
+  String status = "STATUS RIC=" + String(configuredCapcodeInd) +
+                  " RICIND=" + String(configuredCapcodeInd) +
+                  " RICGRP=" + String(configuredCapcodeGrp) +
+                  " CAPCODE=" + String(configuredCapcodeInd) +
                   " BAUD=" + String(configuredBaud) +
                   " INVERT=" + String(configuredInvert ? 1 : 0) +
                   " IDLE=" + String(configuredIdleHigh ? 1 : 0) +
@@ -2023,7 +2033,7 @@ void handleCommand(const std::vector<String> &tokens) {
       queueStatus("ERROR SEND_MIN TX_BUSY");
       return;
     }
-    queueStatus("STATUS MIN START capcode=" + String(capcode) +
+    queueStatus("STATUS MIN START ric=" + String(capcode) +
                 " func=" + String(functionBits) + " preamble=" + String(preambleMs) + "ms");
     return;
   }
@@ -2056,7 +2066,7 @@ void handleCommand(const std::vector<String> &tokens) {
     configuredDefaultFunction = functionBits;
     configuredDefaultPreambleMs = preambleMs;
     minLoop.start(capcode, functionBits, preambleMs, durationSeconds);
-    queueStatus("STATUS SEND_MIN_LOOP START capcode=" + String(capcode) +
+    queueStatus("STATUS SEND_MIN_LOOP START ric=" + String(capcode) +
                 " func=" + String(functionBits) + " preamble=" + String(preambleMs) + "ms");
     return;
   }
@@ -2142,7 +2152,7 @@ void handleCommand(const std::vector<String> &tokens) {
     }
     autotestFast.start(durationSeconds, configuredBaud, configuredInvert, configuredIdleHigh,
                        configuredOutputMode);
-    queueStatus("STATUS AUTOTEST_FAST START capcode=" + String(kDefaultCapcodeInd) +
+    queueStatus("STATUS AUTOTEST_FAST START ric=" + String(kDefaultRicInd) +
                 " baud=512");
     return;
   }
@@ -2238,36 +2248,36 @@ void handleCommand(const std::vector<String> &tokens) {
   if (cmd == "SET" && tokens.size() >= 3) {
     String key = tokens[1];
     key.toUpperCase();
-    if (key == "CAPCODE") {
+    if (key == "CAPCODE" || key == "RIC") {
       configuredCapcodeInd = tokens[2].toInt();
       if (!capGrpWasExplicitlySet) {
         configuredCapcodeGrp = configuredCapcodeInd + 1;
       }
       saveSettings();
-      queueStatus("STATUS CAPS CAPIND=" + String(configuredCapcodeInd) +
-                  " CAPGRP=" + String(configuredCapcodeGrp));
+      queueStatus("STATUS RICS RICIND=" + String(configuredCapcodeInd) +
+                  " RICGRP=" + String(configuredCapcodeGrp));
       return;
     }
-    if (key == "CAPIND") {
+    if (key == "CAPIND" || key == "RICIND") {
       configuredCapcodeInd = tokens[2].toInt();
       saveSettings();
-      queueStatus("STATUS CAPIND=" + String(configuredCapcodeInd));
+      queueStatus("STATUS RICIND=" + String(configuredCapcodeInd));
       return;
     }
-    if (key == "CAPGRP") {
+    if (key == "CAPGRP" || key == "RICGRP") {
       configuredCapcodeGrp = tokens[2].toInt();
       capGrpWasExplicitlySet = true;
       saveSettings();
-      queueStatus("STATUS CAPGRP=" + String(configuredCapcodeGrp));
+      queueStatus("STATUS RICGRP=" + String(configuredCapcodeGrp));
       return;
     }
-    if (key == "CAPS" && tokens.size() >= 4) {
+    if ((key == "CAPS" || key == "RICS") && tokens.size() >= 4) {
       configuredCapcodeInd = tokens[2].toInt();
       configuredCapcodeGrp = tokens[3].toInt();
       capGrpWasExplicitlySet = true;
       saveSettings();
-      queueStatus("STATUS CAPS CAPIND=" + String(configuredCapcodeInd) +
-                  " CAPGRP=" + String(configuredCapcodeGrp));
+      queueStatus("STATUS RICS RICIND=" + String(configuredCapcodeInd) +
+                  " RICGRP=" + String(configuredCapcodeGrp));
       return;
     }
     if (key == "BAUD") {
@@ -2518,14 +2528,14 @@ void setup() {
   bool hasCapInd = preferences.isKey("cap_ind");
   bool hasCapGrp = preferences.isKey("cap_grp");
   bool hasLegacyCap = preferences.isKey("capcode");
-  configuredCapcodeInd = preferences.getUInt("cap_ind", kDefaultCapcodeInd);
-  configuredCapcodeGrp = preferences.getUInt("cap_grp", kDefaultCapcodeGrp);
+  configuredCapcodeInd = preferences.getUInt("cap_ind", kDefaultRicInd);
+  configuredCapcodeGrp = preferences.getUInt("cap_grp", kDefaultRicGrp);
   bool migratedLegacy = false;
   if (hasLegacyCap && !hasCapInd && !hasCapGrp) {
-    uint32_t legacyCapcode = preferences.getUInt("capcode", kDefaultCapcodeInd);
+    uint32_t legacyCapcode = preferences.getUInt("capcode", kDefaultRicInd);
     configuredCapcodeInd = legacyCapcode;
     if (configuredCapcodeInd == 0) {
-      configuredCapcodeGrp = kDefaultCapcodeGrp;
+      configuredCapcodeGrp = kDefaultRicGrp;
     } else {
       configuredCapcodeGrp = configuredCapcodeInd + 1;
     }
@@ -2583,8 +2593,8 @@ void setup() {
   Serial.println("BLE advertising started.");
   Serial.println("PagerBridge ready.");
   Serial.println("Settings:");
-  Serial.println("  CAPIND=" + String(configuredCapcodeInd));
-  Serial.println("  CAPGRP=" + String(configuredCapcodeGrp));
+  Serial.println("  RICIND=" + String(configuredCapcodeInd));
+  Serial.println("  RICGRP=" + String(configuredCapcodeGrp));
   Serial.println("  BAUD=" + String(configuredBaud));
   Serial.println("  INVERT=" + String(configuredInvert ? 1 : 0));
   Serial.println("  IDLE=" + String(configuredIdleHigh ? 1 : 0));
@@ -2641,7 +2651,7 @@ void loop() {
       }
       auto bits = encoder.buildBitstream(request.capcode, request.message);
       if (tx.sendBits(std::move(bits))) {
-        queueStatus("TX_START capcode=" + String(request.capcode));
+        queueStatus("TX_START ric=" + String(request.capcode));
         if (request.store) {
           pageStore.add(request.capcode, request.message, millis(), "TX_START");
           pendingStoredPage = true;
@@ -2659,14 +2669,14 @@ void loop() {
               configuredCapcodeGrp = capcode + 1;
             }
             saveSettings();
-            pageStore.add(capcode, "PROBE_HIT capcode=" + String(capcode), millis(),
+            pageStore.add(capcode, "PROBE_HIT ric=" + String(capcode), millis(),
                           "PROBE_HIT");
             saveSettings();
-            queueStatus("PROBE_HIT capcode=" + String(capcode));
+            queueStatus("PROBE_HIT ric=" + String(capcode));
           },
           [](uint32_t capcode) {
-            queueStatus("PROBE_STEP capcode=" + String(capcode));
-            queueStatus("TX_START capcode=" + String(capcode));
+            queueStatus("PROBE_STEP ric=" + String(capcode));
+            queueStatus("TX_START ric=" + String(capcode));
           });
     }
   }
