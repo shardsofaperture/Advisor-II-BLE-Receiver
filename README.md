@@ -1,5 +1,7 @@
 # PagerBridge (ESP32-S3 → Motorola Advisor II DATA IN)
 
+> **Status: Work in progress / not functional yet.** This project is still under active development and **does not currently work with Motorola Advisor II pagers**. Do not rely on it for production use.
+
 ## What this does (no RF)
 This project turns a Seeed XIAO ESP32-S3 into a BLE/Serial bridge that injects a **POCSAG baseband NRZ stream** directly into a Motorola Advisor II logic board. The RF board is removed; the ESP32 drives the **DATA injection node** on the logic board (continuity to the RF board’s **TA31142 pin 15** net). The pager logic board decodes POCSAG exactly like it would from RF.  
 
