@@ -1,11 +1,11 @@
-# PagerBridge (ESP32-S3 → Motorola Advisor II DATA IN)
+# PagerBridge (ESP32-S3 → Motorola ADVISOR® Gold FLX DATA IN)
 
-> **Status: Work in progress / not functional yet.** This project is still under active development and **does not currently work with Motorola Advisor II pagers**. Do not rely on it for production use.
+> **Status: Work in progress / not functional yet.** This project is still under active development and **does not currently work with Motorola ADVISOR Gold FLX pagers**. Do not rely on it for production use.
 
 ## What this does (no RF)
-This project turns a Seeed XIAO ESP32-S3 into a BLE/Serial bridge that injects a **POCSAG baseband NRZ stream** directly into a Motorola Advisor II logic board. The RF board is removed; the ESP32 drives the **DATA injection node** on the logic board (continuity to the RF board’s **TA31142 pin 15** net). The pager logic board decodes POCSAG exactly like it would from RF.  
+This project turns a Seeed XIAO ESP32-S3 into a BLE/Serial bridge that injects a **baseband NRZ stream** directly into a Motorola ADVISOR Gold FLX logic board. The RF board is removed; the ESP32 drives the **DATA injection node** on the logic board (continuity to the RF board’s **TA31142 pin 15** net). This branch is configured for **FLEX** terminology (RICs) with a **dummy RIC** until the real RIC is known.  
 
-## Wiring / Injection (Advisor II)
+## Wiring / Injection (ADVISOR Gold FLX)
 ### Required
 - **ESP32 GND → pager GND** (common ground is mandatory).  
   - Tie to **TA31142 pin 19** or a nearby ground plane on the RF board.
@@ -27,7 +27,7 @@ If you want PROBE auto-detect to work, wire the pager’s alert indication to **
 - Suggested sources: **buzzer drive** line or **LED/backlight** line.
 - Use a simple conditioning network if needed (e.g., resistor divider or transistor) to make a clean 3.3 V logic signal.
 
-## Advisor II bring-up (RF board installed, data isolated)
+## ADVISOR Gold FLX bring-up (RF board installed, data isolated)
 When the RF board is installed for battery-save wake, keep the RF hardware present but **isolate the data path** so the ESP32 is the only driver of TSP2.
 
 **Wiring checklist**
@@ -43,24 +43,24 @@ When the RF board is installed for battery-save wake, keep the RF hardware prese
   ```
 - Send a minimal bring-up page first:
   ```
-  SEND_MIN <capcode> <function 0-3> <preamble_ms>
+  SEND_MIN <ric> <function 0-3> <preamble_ms>
   ```
 - If there’s no response, toggle polarity and retry:
   ```
   SET INVERT 1
-  SEND_MIN <capcode> <function 0-3> <preamble_ms>
+  SEND_MIN <ric> <function 0-3> <preamble_ms>
   ```
 - `TEST CARRIER` is **only for scope timing** (not for alerting).
 
-## Bring-up checklist (known: POCSAG, 512 bps, capcode 123456)
+## Bring-up checklist (dummy FLEX RIC 1234567)
 **Known values**
-- **Protocol:** POCSAG
+- **Protocol:** FLEX (target)
 - **Baud:** 512 bps
-- **Capcode:** 123456
+- **RIC:** 1234567 (dummy placeholder)
 
 **Recommended starting config**
 - **OUTPUT:** `OPEN_DRAIN` (open-collector)
-- Sweep **INVERT** via `AUTOTEST_FAST` instead of changing capcodes.
+- Sweep **INVERT** via `AUTOTEST_FAST` instead of changing RICs.
 
 **Suggested injection points to try (not guaranteed)**
 - RF header **DATA** pin (commonly pin 4 in related Advisor projects).
@@ -86,11 +86,11 @@ On some logic board revisions, **TSP2 may not accept raw sliced NRZ** or the nod
 Set a list of candidate GPIOs so you can move the injection wire without changing commands:
 ```
 SET_GPIO_LIST 3,4
-AUTOTEST2 123456 120
+AUTOTEST2 1234567 120
 ```
 
 Notes:
-- **123456 and 123457 share the same POCSAG address** because addressing is based on **capcode / 2**. The function bits differentiate them.
+- Replace the dummy RIC once you identify the pager’s real FLEX RIC.
 
 ## Build & flash (PlatformIO)
 1. Install **PlatformIO** in VS Code.
@@ -126,25 +126,25 @@ Shows a single-line summary including baud/invert/output/data GPIO plus default 
 STATUS
 ```
 
-### SET CAPCODE <int>
-Sets the individual capcode (and group to IND+1 unless already set explicitly).
+### SET RIC <int> (alias: SET CAPCODE)
+Sets the individual RIC (and group to IND+1 unless already set explicitly).
 ```
-SET CAPCODE 0123456
-```
-
-### SET CAPIND <int>
-```
-SET CAPIND 0123456
+SET RIC 01234567
 ```
 
-### SET CAPGRP <int>
+### SET RICIND <int> (alias: SET CAPIND)
 ```
-SET CAPGRP 0123457
+SET RICIND 01234567
 ```
 
-### SET CAPS <ind> <grp>
+### SET RICGRP <int> (alias: SET CAPGRP)
 ```
-SET CAPS 0123456 0123457
+SET RICGRP 01234568
+```
+
+### SET RICS <ind> <grp> (alias: SET CAPS)
+```
+SET RICS 01234567 01234568
 ```
 
 ### SET BAUD <512|1200|2400>
@@ -181,33 +181,33 @@ SET_IDLE 1
 ```
 
 ### SET AUTOPROBE <0|1>
-Enable/disable a one-time probe on boot (tries the saved IND then GRP capcodes once).
+Enable/disable a one-time probe on boot (tries the saved IND then GRP RICs once).
 ```
 SET AUTOPROBE 1
 ```
 
 ### PAGE <text>
-Send a page to the configured individual capcode (CAPIND).
+Send a page to the configured individual RIC (RICIND).
 ```
 PAGE Hello
 ```
 
 ### PAGEI <text>
-Force a page to the individual capcode.
+Force a page to the individual RIC.
 ```
 PAGEI Hello
 ```
 
 ### PAGEG <text>
-Force a page to the group capcode.
+Force a page to the group RIC.
 ```
 PAGEG Hello
 ```
 
-### PAGE <capcode> <text>
-Send to a specific capcode.
+### PAGE <ric> <text>
+Send to a specific RIC.
 ```
-PAGE 0123457 Hello
+PAGE 01234567 Hello
 ```
 
 ### TEST CARRIER <ms>
@@ -243,14 +243,14 @@ Emit a 2-second 1010 pattern at the current baud using the selected output mode,
 DEBUG_SCOPE
 ```
 
-### SEND_ADDR <capcode> <function 0-3>
+### SEND_ADDR <ric> <function 0-3>
 ```
-SEND_ADDR 123456 0
+SEND_ADDR 1234567 0
 ```
 
-### SEND_MSG <capcode> <function 0-3> <ascii>
+### SEND_MSG <ric> <function 0-3> <ascii>
 ```
-SEND_MSG 123456 0 "HELLO"
+SEND_MSG 1234567 0 "HELLO"
 ```
 
 ### SEND_CODEWORDS <hex...>
@@ -259,16 +259,16 @@ Inject already-encoded 32-bit codewords (useful for bring-up).
 SEND_CODEWORDS 0x7CD215D8 0x12345678 0x7A89C197
 ```
 
-### SEND_MIN <capcode> <function 0-3> <preamble_ms>
+### SEND_MIN <ric> <function 0-3> <preamble_ms>
 Send a minimal page burst: preamble (1010) + sync + one batch with only the address codeword.
 ```
-SEND_MIN 123456 0 1500
+SEND_MIN 1234567 0 1500
 ```
 
-### SEND_MIN_LOOP <capcode> <function 0-3> <preamble_ms> <seconds>
+### SEND_MIN_LOOP <ric> <function 0-3> <preamble_ms> <seconds>
 Repeat the minimal page burst until timeout.
 ```
-SEND_MIN_LOOP 123456 0 1500 30
+SEND_MIN_LOOP 1234567 0 1500 30
 ```
 
 ### SEND_SYNC
@@ -277,22 +277,19 @@ Send a preamble + sync + short idle for scope verification.
 SEND_SYNC
 ```
 
-### AUTOTEST <capcode> [seconds]
+### AUTOTEST <ric> [seconds]
 Sweep baud/invert/idle/function/preamble combinations to brute-force a working page.
 ```
-AUTOTEST 123456 120
+AUTOTEST 1234567 120
 ```
-Notes:
-- POCSAG maps capcodes to RF addresses via **capcode / 2**, so **123456** and **123457**
-  target the same address; the function bits differentiate them.
 - AUTOTEST tries baud **512/1200/2400**, invert **0/1**, idle **1/0**, function **0-3**,
   and preamble lengths **576/1152/2304**.
 
-### AUTOTEST2 <capcode> [seconds]
+### AUTOTEST2 <ric> [seconds]
 Sweeps **profiles + baud + invert + idle + function + preamble** and iterates across GPIOs in the
 `SET_GPIO_LIST` list (or the single configured GPIO if unset).
 ```
-AUTOTEST2 123456 120
+AUTOTEST2 1234567 120
 ```
 Profiles tested:
 - `NRZ_SLICED`
@@ -308,7 +305,7 @@ AUTOTEST2 STOP
 ```
 
 ### AUTOTEST_FAST <seconds>
-Fast deterministic sweep for bring-up (fixed capcode 123456 at 512 bps, no capcode sweep).
+Fast deterministic sweep for bring-up (fixed RIC 1234567 at 512 bps, no RIC sweep).
 ```
 AUTOTEST_FAST 60
 ```
@@ -338,7 +335,7 @@ CLEAR
 ```
 
 ### PROBE START <start> <end> <step>
-Sequentially probe capcodes and auto-detect a “hit” using ALERT_GPIO.
+Sequentially probe RICs and auto-detect a “hit” using ALERT_GPIO.
 ```
 PROBE START 90000 92000 1
 ```
@@ -356,13 +353,13 @@ PROBE STOP
 ```
 
 ### PROBE ONESHOT <cap1> <cap2> ...
-Send probe pages once per capcode **without** auto-detection (manual watch).
+Send probe pages once per RIC **without** auto-detection (manual watch).
 ```
 PROBE ONESHOT 91833 91834 91835
 ```
 
 ### SAVE
-Force-save settings to NVS (capcodes/baud/invert/autoprobe + recent pages).
+Force-save settings to NVS (RICs/baud/invert/autoprobe + recent pages).
 ```
 SAVE
 ```
@@ -381,11 +378,11 @@ SAVE
    ```
 6. If you need auto-probe, wire ALERT_GPIO and use `PROBE START` or `PROBE BINARY`.
 
-## Recommended settings (Advisor II TA31142 injection)
+## Recommended settings (ADVISOR Gold FLX TA31142 injection)
 - **BAUD:** 512  
 - **INVERT:** 0  
 - **OUTPUT:** OPEN_DRAIN  
-- **CAPCODES:** 123456 (individual) / 123457 (group)
+- **RICs:** 1234567 (individual) / 1234568 (group)
 
 ## Injecting into logic board (no RF board)
 When the RF/IF board is removed, the logic board still expects **sliced data** on the node that
@@ -407,11 +404,11 @@ normally connects to the RF detector’s **FSK OUT / sliced data** line. Wire:
    ```
    TEST CARRIER 3000
    ```
-3. Page individual capcode:
+3. Page individual RIC:
    ```
    PAGEI test
    ```
-4. Page group capcode:
+4. Page group RIC:
    ```
    PAGEG test
    ```
@@ -423,8 +420,8 @@ normally connects to the RF detector’s **FSK OUT / sliced data** line. Wire:
   Toggle `SET INVERT 0/1`. The DATA line polarity must match the logic board.
 - **Nothing happens at all**  
   Verify **common ground** and the DATA injection node continuity to the TA31142 pin 15 net.
-- **Probe doesn’t auto-save capcodes**  
+- **Probe doesn’t auto-save RICs**  
   `PROBE START` and `PROBE BINARY` **require ALERT_GPIO**. If ALERT_GPIO isn’t wired, you’ll get `ERROR PROBE NO_ALERT_GPIO`. Use `PROBE ONESHOT` and watch the pager manually.
 
 ### Notes
-- Leading zeros are just formatting (e.g., **0123456 == 123456**).
+- Leading zeros are just formatting (e.g., **01234567 == 1234567**).
