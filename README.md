@@ -219,6 +219,23 @@ Send a preamble + sync + short idle for scope verification.
 SEND_SYNC
 ```
 
+### AUTOTEST <capcode> [seconds]
+Sweep baud/invert/idle/function/preamble combinations to brute-force a working page.
+```
+AUTOTEST 123456 120
+```
+Notes:
+- POCSAG maps capcodes to RF addresses via **capcode / 2**, so **123456** and **123457**
+  target the same address; the function bits differentiate them.
+- AUTOTEST tries baud **512/1200/2400**, invert **0/1**, idle **1/0**, function **0-3**,
+  and preamble lengths **576/1152/2304**.
+
+### AUTOTEST STOP
+Stop a running AUTOTEST early.
+```
+AUTOTEST STOP
+```
+
 ### LIST
 List stored pages (newest first). Output is chunked into status notifications and also printed to Serial.
 ```

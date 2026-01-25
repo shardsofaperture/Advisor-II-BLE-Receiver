@@ -209,7 +209,8 @@ class PocsagEncoder {
     std::vector<uint32_t> words;
     words.reserve(kPocsagBatchWordCount);
     words.push_back(kSyncWord);
-    uint8_t frame = capcode % 8;
+    uint32_t ric = capcode / 2;
+    uint8_t frame = ric % 8;
     uint32_t addressWord = buildAddressWord(capcode, functionBits);
     uint32_t messageWord = message ? buildMessageWordFromText(*message) : kIdleWord;
     for (uint8_t frameIndex = 0; frameIndex < 8; ++frameIndex) {
@@ -222,6 +223,10 @@ class PocsagEncoder {
       }
     }
     return words;
+  }
+
+  uint32_t buildAddressCodeword(uint32_t capcode, uint8_t functionBits) const {
+    return buildAddressWord(capcode, functionBits);
   }
 
  private:
@@ -245,7 +250,8 @@ class PocsagEncoder {
     uint32_t addressWord = buildAddressWord(capcode, functionBits);
 
     size_t messageIndex = 0;
-    uint8_t frame = capcode % 8;
+    uint32_t ric = capcode / 2;
+    uint8_t frame = ric % 8;
     bool addressInserted = false;
 
     bool done = false;
@@ -371,7 +377,7 @@ class PocsagEncoder {
   }
 
   uint32_t buildAddressWord(uint32_t capcode, uint8_t functionBits) const {
-    uint32_t address = capcode / 8;
+    uint32_t address = (capcode / 2) / 8;
     uint32_t data = (address & 0x3FFFF) << 2;
     data |= (functionBits & 0x3);
     uint32_t cw = buildCodeword(0, data);
@@ -762,6 +768,179 @@ class ProbeController {
   uint32_t nextAllowedMs_ = 0;
 };
 
+void queueStatus(const String &message);
+
+class AutotestController {
+ public:
+  AutotestController(PocsagTx &tx, const PocsagEncoder &encoder)
+      : tx_(tx), encoder_(encoder) {}
+
+  void start(uint32_t capcode, uint32_t durationSeconds, uint32_t savedBaud,
+             bool savedInvert, bool savedIdleHigh) {
+    capcode_ = capcode;
+    endTimeMs_ = millis() + durationSeconds * 1000;
+    attempt_ = 0;
+    baudIndex_ = 0;
+    invertIndex_ = 0;
+    idleIndex_ = 0;
+    functionIndex_ = 0;
+    preambleIndex_ = 0;
+    stopRequested_ = false;
+    active_ = true;
+    savedBaud_ = savedBaud;
+    savedInvert_ = savedInvert;
+    savedIdleHigh_ = savedIdleHigh;
+  }
+
+  void requestStop() { stopRequested_ = true; }
+
+  bool isActive() const { return active_; }
+
+  void update() {
+    if (!active_) {
+      return;
+    }
+    if (tx_.isBusy()) {
+      return;
+    }
+    if (stopRequested_ || millis() >= endTimeMs_) {
+      finish(stopRequested_ ? "STATUS AUTOTEST STOPPED" : "STATUS AUTOTEST DONE");
+      return;
+    }
+    AutotestSettings settings = currentSettings();
+    ++attempt_;
+    queueStatus(buildAttemptLine(settings));
+    tx_.setBaud(settings.baud);
+    tx_.setInvert(settings.invert);
+    tx_.setIdleHigh(settings.idleHigh);
+    auto bits = buildAutotestBits(settings);
+    if (!tx_.sendBits(std::move(bits))) {
+      queueStatus("ERROR AUTOTEST TX_BUSY");
+      return;
+    }
+    advance();
+  }
+
+ private:
+  struct AutotestSettings {
+    uint32_t baud = 512;
+    bool invert = false;
+    bool idleHigh = true;
+    uint8_t functionBits = 0;
+    uint32_t preambleBits = 576;
+  };
+
+  static constexpr uint32_t kBauds[] = {512, 1200, 2400};
+  static constexpr bool kInverts[] = {false, true};
+  static constexpr bool kIdleHighs[] = {true, false};
+  static constexpr uint32_t kPreambles[] = {576, 1152, 2304};
+  static constexpr size_t kBaudCount = sizeof(kBauds) / sizeof(kBauds[0]);
+  static constexpr size_t kInvertCount = sizeof(kInverts) / sizeof(kInverts[0]);
+  static constexpr size_t kIdleHighCount = sizeof(kIdleHighs) / sizeof(kIdleHighs[0]);
+  static constexpr size_t kPreambleCount = sizeof(kPreambles) / sizeof(kPreambles[0]);
+
+  AutotestSettings currentSettings() const {
+    AutotestSettings settings;
+    settings.baud = kBauds[baudIndex_];
+    settings.invert = kInverts[invertIndex_];
+    settings.idleHigh = kIdleHighs[idleIndex_];
+    settings.functionBits = static_cast<uint8_t>(functionIndex_);
+    settings.preambleBits = kPreambles[preambleIndex_];
+    return settings;
+  }
+
+  String buildAttemptLine(const AutotestSettings &settings) const {
+    String line = "AUTOTEST #" + String(attempt_) + " CAP=" + String(capcode_) +
+                  " BAUD=" + String(settings.baud) +
+                  " INVERT=" + String(settings.invert ? 1 : 0) +
+                  " IDLE=" + String(settings.idleHigh ? 1 : 0) +
+                  " FUNC=" + String(settings.functionBits) +
+                  " PREAMBLE=" + String(settings.preambleBits);
+    return line;
+  }
+
+  void advance() {
+    ++preambleIndex_;
+    if (preambleIndex_ >= kPreambleCount) {
+      preambleIndex_ = 0;
+      ++functionIndex_;
+      if (functionIndex_ >= 4) {
+        functionIndex_ = 0;
+        ++idleIndex_;
+        if (idleIndex_ >= kIdleHighCount) {
+          idleIndex_ = 0;
+          ++invertIndex_;
+          if (invertIndex_ >= kInvertCount) {
+            invertIndex_ = 0;
+            ++baudIndex_;
+            if (baudIndex_ >= kBaudCount) {
+              baudIndex_ = 0;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  void appendWordBits(std::vector<uint8_t> &bits, uint32_t word) const {
+    for (int i = 31; i >= 0; --i) {
+      bits.push_back(static_cast<uint8_t>((word >> i) & 0x1));
+    }
+  }
+
+  std::vector<uint8_t> buildAutotestBits(const AutotestSettings &settings) const {
+    std::vector<uint8_t> bits;
+    bits.reserve(settings.preambleBits + (1 + 16) * 32);
+    for (uint32_t i = 0; i < settings.preambleBits; ++i) {
+      bits.push_back(static_cast<uint8_t>((i % 2) == 0));
+    }
+    appendWordBits(bits, kSyncWord);
+    uint32_t ric = capcode_ / 2;
+    uint8_t frame = ric % 8;
+    uint32_t addressWord = encoder_.buildAddressCodeword(capcode_, settings.functionBits);
+    for (uint8_t frameIndex = 0; frameIndex < 8; ++frameIndex) {
+      if (frameIndex == frame) {
+        appendWordBits(bits, addressWord);
+        appendWordBits(bits, kIdleWord);
+      } else {
+        appendWordBits(bits, kIdleWord);
+        appendWordBits(bits, kIdleWord);
+      }
+    }
+    return bits;
+  }
+
+  void finish(const String &status) {
+    active_ = false;
+    stopRequested_ = false;
+    tx_.setBaud(savedBaud_);
+    tx_.setInvert(savedInvert_);
+    tx_.setIdleHigh(savedIdleHigh_);
+    queueStatus(status);
+  }
+
+  PocsagTx &tx_;
+  const PocsagEncoder &encoder_;
+  bool active_ = false;
+  bool stopRequested_ = false;
+  uint32_t capcode_ = 0;
+  uint32_t endTimeMs_ = 0;
+  size_t attempt_ = 0;
+  size_t baudIndex_ = 0;
+  size_t invertIndex_ = 0;
+  size_t idleIndex_ = 0;
+  size_t functionIndex_ = 0;
+  size_t preambleIndex_ = 0;
+  uint32_t savedBaud_ = kDefaultBaud;
+  bool savedInvert_ = kDefaultInvert;
+  bool savedIdleHigh_ = kDefaultIdleLineHigh;
+};
+
+constexpr uint32_t AutotestController::kBauds[];
+constexpr bool AutotestController::kInverts[];
+constexpr bool AutotestController::kIdleHighs[];
+constexpr uint32_t AutotestController::kPreambles[];
+
 class CommandParser {
  public:
   using Handler = std::function<void(const std::vector<String> &)>;
@@ -905,6 +1084,7 @@ static PocsagEncoder encoder;
 static PocsagTx tx;
 static PageStore pageStore(kPageStoreCapacity);
 static ProbeController probe(tx, encoder);
+static AutotestController autotest(tx, encoder);
 static CommandParser parser;
 
 static std::deque<TxRequest> txQueue;
@@ -939,8 +1119,8 @@ void saveSettings() {
   preferences.putUInt("baud", configuredBaud);
   preferences.putBool("invert", configuredInvert);
   preferences.putUChar("output", static_cast<uint8_t>(configuredOutputMode));
-  preferences.putInt("data_gpio", configuredDataGpio);
-  preferences.putBool("idle_high", configuredIdleHigh);
+  preferences.putInt("dataGpio", configuredDataGpio);
+  preferences.putBool("idleHigh", configuredIdleHigh);
   preferences.putBool("autoProbe", configuredAutoProbe);
   pageStore.persist(preferences);
 }
@@ -1013,7 +1193,7 @@ String buildStatusLine() {
                   " CAPGRP=" + String(configuredCapcodeGrp) +
                   " BAUD=" + String(configuredBaud) +
                   " INVERT=" + String(configuredInvert ? 1 : 0) +
-                  " IDLE_HIGH=" + String(configuredIdleHigh ? 1 : 0) +
+                  " IDLE=" + String(configuredIdleHigh ? 1 : 0) +
                   " OUTPUT=" +
                   String(configuredOutputMode == OutputMode::kPushPull ? "PUSH_PULL"
                                                                        : "OPEN_DRAIN") +
@@ -1077,7 +1257,7 @@ void handleCommand(const std::vector<String> &tokens) {
     configuredIdleHigh = tokens[1].toInt() != 0;
     tx.setIdleHigh(configuredIdleHigh);
     saveSettings();
-    queueStatus("STATUS IDLE_HIGH=" + String(configuredIdleHigh ? 1 : 0));
+    queueStatus("STATUS IDLE=" + String(configuredIdleHigh ? 1 : 0));
     return;
   }
   if (cmd == "SET_MODE" && tokens.size() >= 2) {
@@ -1102,6 +1282,10 @@ void handleCommand(const std::vector<String> &tokens) {
     uint32_t pin = 0;
     if (!parseUint32(tokens[1], pin)) {
       queueStatus("ERROR GPIO INVALID");
+      return;
+    }
+    if (tx.isBusy()) {
+      queueStatus("ERROR GPIO BUSY");
       return;
     }
     configuredDataGpio = static_cast<int>(pin);
@@ -1143,6 +1327,48 @@ void handleCommand(const std::vector<String> &tokens) {
     std::vector<uint8_t> bits = encoder.buildBitstreamFromCodewords(codewords, true);
     enqueueRawBits(std::move(bits), "SYNC_ONLY");
     queueStatus("STATUS SYNC QUEUED");
+    return;
+  }
+  if (cmd == "AUTOTEST" && tokens.size() >= 2) {
+    String value = tokens[1];
+    value.toUpperCase();
+    if (value == "STOP") {
+      if (!autotest.isActive()) {
+        queueStatus("ERROR AUTOTEST NOT_ACTIVE");
+        return;
+      }
+      autotest.requestStop();
+      if (!tx.isBusy()) {
+        autotest.update();
+      }
+      return;
+    }
+    uint32_t capcode = 0;
+    if (!parseUint32(tokens[1], capcode)) {
+      queueStatus("ERROR AUTOTEST INVALID");
+      return;
+    }
+    uint32_t durationSeconds = 60;
+    if (tokens.size() >= 3) {
+      if (!parseUint32(tokens[2], durationSeconds) || durationSeconds == 0) {
+        queueStatus("ERROR AUTOTEST DURATION");
+        return;
+      }
+    }
+    if (autotest.isActive()) {
+      queueStatus("ERROR AUTOTEST BUSY");
+      return;
+    }
+    if (tx.isBusy()) {
+      queueStatus("ERROR AUTOTEST TX_BUSY");
+      return;
+    }
+    if (probe.isActive()) {
+      probe.stop();
+    }
+    autotest.start(capcode, durationSeconds, configuredBaud, configuredInvert,
+                   configuredIdleHigh);
+    queueStatus("STATUS AUTOTEST START");
     return;
   }
   if (cmd == "SEND_ADDR" && tokens.size() >= 3) {
@@ -1246,7 +1472,7 @@ void handleCommand(const std::vector<String> &tokens) {
       configuredIdleHigh = tokens[2].toInt() != 0;
       tx.setIdleHigh(configuredIdleHigh);
       saveSettings();
-      queueStatus("STATUS IDLE_HIGH=" + String(configuredIdleHigh ? 1 : 0));
+      queueStatus("STATUS IDLE=" + String(configuredIdleHigh ? 1 : 0));
       return;
     }
     if (key == "OUTPUT") {
@@ -1491,8 +1717,14 @@ void setup() {
   configuredOutputMode =
       outputValue == static_cast<uint8_t>(OutputMode::kOpenDrain) ? OutputMode::kOpenDrain
                                                                    : OutputMode::kPushPull;
-  configuredDataGpio = preferences.getInt("data_gpio", kDataGpio);
-  configuredIdleHigh = preferences.getBool("idle_high", kDefaultIdleLineHigh);
+  bool hasDataGpio = preferences.isKey("dataGpio");
+  bool hasIdleHigh = preferences.isKey("idleHigh");
+  configuredDataGpio =
+      hasDataGpio ? preferences.getInt("dataGpio", kDataGpio)
+                  : preferences.getInt("data_gpio", kDataGpio);
+  configuredIdleHigh =
+      hasIdleHigh ? preferences.getBool("idleHigh", kDefaultIdleLineHigh)
+                  : preferences.getBool("idle_high", kDefaultIdleLineHigh);
   configuredAutoProbe = preferences.getBool("autoProbe", false);
   pageStore.load(preferences);
   if (migratedLegacy) {
@@ -1533,7 +1765,7 @@ void setup() {
   Serial.println("  CAPGRP=" + String(configuredCapcodeGrp));
   Serial.println("  BAUD=" + String(configuredBaud));
   Serial.println("  INVERT=" + String(configuredInvert ? 1 : 0));
-  Serial.println("  IDLE_HIGH=" + String(configuredIdleHigh ? 1 : 0));
+  Serial.println("  IDLE=" + String(configuredIdleHigh ? 1 : 0));
   Serial.println("  OUTPUT=" +
                  String(configuredOutputMode == OutputMode::kPushPull ? "PUSH_PULL"
                                                                       : "OPEN_DRAIN"));
@@ -1561,45 +1793,50 @@ void loop() {
     }
   }
 
-  if (!tx.isBusy() && !txQueue.empty() && !probe.isActive()) {
-    TxRequest request = txQueue.front();
-    txQueue.pop_front();
-    if (request.isRaw) {
-      if (tx.sendBits(std::move(request.rawBits))) {
-        queueStatus("TX_START " + request.label);
+  if (autotest.isActive()) {
+    autotest.update();
+  } else {
+    if (!tx.isBusy() && !txQueue.empty() && !probe.isActive()) {
+      TxRequest request = txQueue.front();
+      txQueue.pop_front();
+      if (request.isRaw) {
+        if (tx.sendBits(std::move(request.rawBits))) {
+          queueStatus("TX_START " + request.label);
+        } else {
+          queueStatus("ERROR TX_BUSY");
+        }
+        return;
+      }
+      auto bits = encoder.buildBitstream(request.capcode, request.message);
+      if (tx.sendBits(std::move(bits))) {
+        queueStatus("TX_START capcode=" + String(request.capcode));
+        if (request.store) {
+          pageStore.add(request.capcode, request.message, millis(), "TX_START");
+          pendingStoredPage = true;
+        }
       } else {
         queueStatus("ERROR TX_BUSY");
       }
-      return;
     }
-    auto bits = encoder.buildBitstream(request.capcode, request.message);
-    if (tx.sendBits(std::move(bits))) {
-      queueStatus("TX_START capcode=" + String(request.capcode));
-      if (request.store) {
-        pageStore.add(request.capcode, request.message, millis(), "TX_START");
-        pendingStoredPage = true;
-      }
-    } else {
-      queueStatus("ERROR TX_BUSY");
-    }
-  }
 
-  if (probe.isActive()) {
-    probe.update(
-        [](uint32_t capcode) {
-          configuredCapcodeInd = capcode;
-          if (!capGrpWasExplicitlySet) {
-            configuredCapcodeGrp = capcode + 1;
-          }
-          saveSettings();
-          pageStore.add(capcode, "PROBE_HIT capcode=" + String(capcode), millis(), "PROBE_HIT");
-          saveSettings();
-          queueStatus("PROBE_HIT capcode=" + String(capcode));
-        },
-        [](uint32_t capcode) {
-          queueStatus("PROBE_STEP capcode=" + String(capcode));
-          queueStatus("TX_START capcode=" + String(capcode));
-        });
+    if (probe.isActive()) {
+      probe.update(
+          [](uint32_t capcode) {
+            configuredCapcodeInd = capcode;
+            if (!capGrpWasExplicitlySet) {
+              configuredCapcodeGrp = capcode + 1;
+            }
+            saveSettings();
+            pageStore.add(capcode, "PROBE_HIT capcode=" + String(capcode), millis(),
+                          "PROBE_HIT");
+            saveSettings();
+            queueStatus("PROBE_HIT capcode=" + String(capcode));
+          },
+          [](uint32_t capcode) {
+            queueStatus("PROBE_STEP capcode=" + String(capcode));
+            queueStatus("TX_START capcode=" + String(capcode));
+          });
+    }
   }
 
   while (Serial.available() > 0) {
