@@ -5,6 +5,7 @@
 
 #include "driver/rmt.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 
 namespace {
@@ -27,7 +28,7 @@ struct Config {
   bool invertWords = false;
   bool driveOneLow = true;
   bool idleHigh = true;
-  bool blockingTx = true;
+  bool blockingTx = false;
   String bootPreset = "ADVISOR";
   bool firstBootShown = false;
 };
@@ -35,6 +36,17 @@ struct Config {
 static Config config;
 
 static void printStatus();
+
+struct TxJob {
+  std::vector<uint8_t> bits;
+  uint32_t baud;
+  int gpio;
+  OutputMode output;
+  bool idleHigh;
+  bool driveOneLow;
+};
+
+static QueueHandle_t txQueue = nullptr;
 
 class WaveTx {
  public:
@@ -290,6 +302,19 @@ class PocsagEncoder {
 
 static PocsagEncoder encoder;
 static WaveTx waveTx;
+
+static void txWorkerTask(void *context) {
+  (void)context;
+  while (true) {
+    TxJob *job = nullptr;
+    if (xQueueReceive(txQueue, &job, portMAX_DELAY) != pdTRUE || job == nullptr) {
+      continue;
+    }
+    waveTx.transmitBits(job->bits, job->baud, job->gpio, job->output, job->idleHigh,
+                        job->driveOneLow, true);
+    delete job;
+  }
+}
 
 static String readFileToString(const char *path) {
   File file = LittleFS.open(path, "r");
@@ -566,6 +591,22 @@ static std::vector<uint8_t> buildIdleBits(uint32_t durationMs, uint32_t baud, bo
   return std::vector<uint8_t>(bitCount, idleBit);
 }
 
+static std::vector<uint8_t> buildSyncAndBatchBits(const std::vector<uint32_t> &words,
+                                                  bool invertWords) {
+  std::vector<uint8_t> bits;
+  bits.reserve(544);
+  uint32_t syncWord = invertWords ? ~kSyncWord : kSyncWord;
+  for (int i = 31; i >= 0; --i) {
+    bits.push_back(static_cast<uint8_t>((syncWord >> i) & 0x1));
+  }
+  for (uint32_t word : words) {
+    for (int i = 31; i >= 0; --i) {
+      bits.push_back(static_cast<uint8_t>((word >> i) & 0x1));
+    }
+  }
+  return bits;
+}
+
 static void applyWordInversion(std::vector<uint32_t> &words, bool invertWords) {
   if (!invertWords) {
     return;
@@ -584,6 +625,15 @@ static std::vector<uint32_t> buildMinimalBatch(uint32_t capcode, uint8_t functio
     words[index] = addressWord;
   }
   return words;
+}
+
+static uint32_t computeRepeatBatches(uint32_t repeatMs, uint32_t baud) {
+  uint64_t totalBits = static_cast<uint64_t>(repeatMs) * static_cast<uint64_t>(baud);
+  uint32_t totalBatches = static_cast<uint32_t>(totalBits / (1000ULL * 544ULL));
+  if (totalBatches == 0) {
+    totalBatches = 1;
+  }
+  return totalBatches;
 }
 
 static std::vector<uint8_t> buildPocsagBits(const String &message, uint32_t capcode,
@@ -610,40 +660,78 @@ static std::vector<uint8_t> buildPocsagBits(const String &message, uint32_t capc
   return bits;
 }
 
+static std::vector<uint8_t> buildRepeatedPocsagBits(const String &message, uint32_t capcode,
+                                                    uint32_t preambleBits, uint32_t repeatMs) {
+  std::vector<uint8_t> bits;
+  if (preambleBits > 0) {
+    bits.reserve(preambleBits);
+    for (uint32_t i = 0; i < preambleBits; ++i) {
+      bits.push_back(static_cast<uint8_t>(i % 2 == 0));
+    }
+  }
+  std::vector<uint32_t> words = encoder.buildBatchWords(capcode, config.functionBits, message);
+  applyWordInversion(words, config.invertWords);
+  std::vector<uint8_t> batchBits = buildSyncAndBatchBits(words, config.invertWords);
+  uint32_t totalBatches = computeRepeatBatches(repeatMs, config.baud);
+  bits.reserve(bits.size() + (batchBits.size() * totalBatches));
+  for (uint32_t i = 0; i < totalBatches; ++i) {
+    bits.insert(bits.end(), batchBits.begin(), batchBits.end());
+  }
+  return bits;
+}
+
 static std::vector<uint8_t> buildMinimalPocsagBits(uint32_t capcode, uint8_t functionBits,
                                                    uint32_t preambleMs) {
   std::vector<uint8_t> bits = buildAlternatingBits(preambleMs, config.baud);
   std::vector<uint32_t> words = buildMinimalBatch(capcode, functionBits);
   applyWordInversion(words, config.invertWords);
-  uint32_t syncWord = config.invertWords ? ~kSyncWord : kSyncWord;
-  for (int i = 31; i >= 0; --i) {
-    bits.push_back(static_cast<uint8_t>((syncWord >> i) & 0x1));
-  }
-  for (uint32_t word : words) {
-    for (int i = 31; i >= 0; --i) {
-      bits.push_back(static_cast<uint8_t>((word >> i) & 0x1));
-    }
+  std::vector<uint8_t> batchBits = buildSyncAndBatchBits(words, config.invertWords);
+  bits.insert(bits.end(), batchBits.begin(), batchBits.end());
+  return bits;
+}
+
+static std::vector<uint8_t> buildRepeatedMinimalBits(uint32_t capcode, uint8_t functionBits,
+                                                     uint32_t preambleMs, uint32_t repeatMs) {
+  std::vector<uint8_t> bits = buildAlternatingBits(preambleMs, config.baud);
+  std::vector<uint32_t> words = buildMinimalBatch(capcode, functionBits);
+  applyWordInversion(words, config.invertWords);
+  std::vector<uint8_t> batchBits = buildSyncAndBatchBits(words, config.invertWords);
+  uint32_t totalBatches = computeRepeatBatches(repeatMs, config.baud);
+  bits.reserve(bits.size() + (batchBits.size() * totalBatches));
+  for (uint32_t i = 0; i < totalBatches; ++i) {
+    bits.insert(bits.end(), batchBits.begin(), batchBits.end());
   }
   return bits;
 }
 
-static bool sendMessageOnce(const String &message, uint32_t capcode) {
-  std::vector<uint8_t> bits = buildPocsagBits(message, capcode, config.preambleBits);
-  if (!waveTx.transmitBits(bits, config.baud, config.dataGpio, config.output, config.idleHigh,
-                           config.driveOneLow, config.blockingTx)) {
+static bool queueTxJob(const std::vector<uint8_t> &bits) {
+  if (!txQueue) {
+    Serial.println("ERR: TX_QUEUE");
+    return false;
+  }
+  if (waveTx.refreshBusy() || uxQueueSpacesAvailable(txQueue) == 0) {
     Serial.println("TX_BUSY");
     return false;
   }
+  TxJob *job = new TxJob{bits, config.baud, config.dataGpio, config.output, config.idleHigh,
+                         config.driveOneLow};
+  if (xQueueSend(txQueue, &job, 0) != pdTRUE) {
+    delete job;
+    Serial.println("TX_BUSY");
+    return false;
+  }
+  Serial.println("QUEUED");
   return true;
+}
+
+static bool sendMessageOnce(const String &message, uint32_t capcode) {
+  std::vector<uint8_t> bits = buildRepeatedPocsagBits(message, capcode, config.preambleBits, 3000);
+  return queueTxJob(bits);
 }
 
 static void handleScope(uint32_t durationMs) {
   std::vector<uint8_t> bits = buildAlternatingBits(durationMs, config.baud);
-  if (!waveTx.transmitBits(bits, config.baud, config.dataGpio, config.output, config.idleHigh,
-                           config.driveOneLow, config.blockingTx)) {
-    Serial.println("TX_BUSY");
-    return;
-  }
+  queueTxJob(bits);
 }
 
 static void handleDebugScope() {
@@ -651,17 +739,27 @@ static void handleDebugScope() {
   std::vector<uint8_t> idleBits =
       buildIdleBits(2000, config.baud, config.driveOneLow, config.idleHigh);
   bits.insert(bits.end(), idleBits.begin(), idleBits.end());
-  if (!waveTx.transmitBits(bits, config.baud, config.dataGpio, config.output, config.idleHigh,
-                           config.driveOneLow, config.blockingTx)) {
-    Serial.println("TX_BUSY");
-  }
+  queueTxJob(bits);
 }
 
-static void handleSendMin(uint32_t capcode, uint8_t functionBits) {
-  std::vector<uint8_t> bits = buildMinimalPocsagBits(capcode, functionBits, 2000);
-  if (!waveTx.transmitBits(bits, config.baud, config.dataGpio, config.output, config.idleHigh,
-                           config.driveOneLow, config.blockingTx)) {
-    Serial.println("TX_BUSY");
+static void handleSendMin(uint32_t capcode, uint8_t functionBits, uint32_t repeatMs) {
+  std::vector<uint8_t> bits = buildRepeatedMinimalBits(capcode, functionBits, 2000, repeatMs);
+  queueTxJob(bits);
+}
+
+static void handleDumpMin(uint32_t capcode, uint8_t functionBits) {
+  uint8_t frame = static_cast<uint8_t>(capcode & 0x7);
+  uint32_t addressWord = encoder.buildAddressCodeword(capcode, functionBits);
+  std::vector<uint32_t> words = buildMinimalBatch(capcode, functionBits);
+  if (config.invertWords) {
+    addressWord = ~addressWord;
+  }
+  applyWordInversion(words, config.invertWords);
+  Serial.printf("frame=%u\n", frame);
+  Serial.printf("address=0x%08lX\n", static_cast<unsigned long>(addressWord));
+  for (size_t i = 0; i < words.size(); ++i) {
+    Serial.printf("batch[%u]=0x%08lX\n", static_cast<unsigned int>(i),
+                  static_cast<unsigned long>(words[i]));
   }
 }
 
@@ -721,7 +819,7 @@ static void printHelp() {
   Serial.println("POCSAG TX (RMT) Commands:");
   Serial.println(
       "  STATUS | HELP | ? | PRESET <name> | SCOPE <ms> | DEBUG_SCOPE | H | SEND <text> | "
-      "SEND_MIN <capcode> [func] | STATUS_TX | T1 <sec>");
+      "SEND_MIN <capcode> [func] [repeatMs] | DUMP_MIN <capcode> <func> | STATUS_TX | T1 <sec>");
   Serial.println("  SET <key> <value> | SAVE | LOAD");
   Serial.println("Presets: ADVISOR | GENERIC");
   Serial.println("SET keys: baud preambleBits capInd capGrp functionBits dataGpio output");
@@ -733,7 +831,9 @@ static void printHelp() {
   Serial.println("  DEBUG_SCOPE");
   Serial.println("  H");
   Serial.println("  SEND HELLO WORLD");
-  Serial.println("  SEND_MIN 1422890 2");
+  Serial.println("  SEND_MIN 1422890 2 4000");
+  Serial.println("  STATUS_TX");
+  Serial.println("  DUMP_MIN 1422890 2");
   Serial.println("  T1 10");
   Serial.println(
       "ADVISOR preset: baud=512 invertWords=false driveOneLow=true idleHigh=true output=push_pull");
@@ -760,7 +860,11 @@ static void handleCommand(const String &line) {
     return;
   }
   if (cmd == "STATUS_TX") {
-    Serial.println(waveTx.refreshBusy() ? "TX_BUSY" : "TX_IDLE");
+    bool busy = waveTx.refreshBusy();
+    if (txQueue && uxQueueMessagesWaiting(txQueue) > 0) {
+      busy = true;
+    }
+    Serial.println(busy ? "TX_BUSY" : "TX_IDLE");
     return;
   }
   if (cmd == "SAVE") {
@@ -799,7 +903,7 @@ static void handleCommand(const String &line) {
   }
   if (cmd == "SEND_MIN") {
     if (space < 0) {
-      Serial.println("ERR: SEND_MIN <capcode> [func]");
+      Serial.println("ERR: SEND_MIN <capcode> [func] [repeatMs]");
       return;
     }
     int secondSpace = trimmed.indexOf(' ', space + 1);
@@ -807,10 +911,33 @@ static void handleCommand(const String &line) {
         (secondSpace < 0) ? trimmed.substring(space + 1) : trimmed.substring(space + 1, secondSpace);
     uint32_t capcode = static_cast<uint32_t>(capcodeValue.toInt());
     uint8_t functionBits = 2;
+    uint32_t repeatMs = 4000;
     if (secondSpace >= 0) {
-      functionBits = static_cast<uint8_t>(trimmed.substring(secondSpace + 1).toInt() & 0x3);
+      int thirdSpace = trimmed.indexOf(' ', secondSpace + 1);
+      String funcValue =
+          (thirdSpace < 0) ? trimmed.substring(secondSpace + 1)
+                           : trimmed.substring(secondSpace + 1, thirdSpace);
+      functionBits = static_cast<uint8_t>(funcValue.toInt() & 0x3);
+      if (thirdSpace >= 0) {
+        repeatMs = static_cast<uint32_t>(trimmed.substring(thirdSpace + 1).toInt());
+      }
     }
-    handleSendMin(capcode, functionBits);
+    handleSendMin(capcode, functionBits, repeatMs);
+    return;
+  }
+  if (cmd == "DUMP_MIN") {
+    if (space < 0) {
+      Serial.println("ERR: DUMP_MIN <capcode> <func>");
+      return;
+    }
+    int secondSpace = trimmed.indexOf(' ', space + 1);
+    if (secondSpace < 0) {
+      Serial.println("ERR: DUMP_MIN <capcode> <func>");
+      return;
+    }
+    uint32_t capcode = static_cast<uint32_t>(trimmed.substring(space + 1, secondSpace).toInt());
+    uint8_t functionBits = static_cast<uint8_t>(trimmed.substring(secondSpace + 1).toInt() & 0x3);
+    handleDumpMin(capcode, functionBits);
     return;
   }
   if (cmd == "T1") {
@@ -850,6 +977,12 @@ void setup() {
     applyConfigPins();
   }
   applyConfigPins();
+  txQueue = xQueueCreate(2, sizeof(TxJob *));
+  if (txQueue) {
+    xTaskCreatePinnedToCore(txWorkerTask, "txWorker", 8192, nullptr, 1, nullptr, 0);
+  } else {
+    Serial.println("ERR: TX_QUEUE_CREATE");
+  }
   printStatus();
   printHelp();
   if (!config.firstBootShown) {
