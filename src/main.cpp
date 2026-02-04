@@ -71,6 +71,11 @@ class PocsagEncoder {
     return bits;
   }
 
+  std::vector<uint32_t> buildBatchWords(uint32_t capcode, uint8_t functionBits,
+                                        const String &message) const {
+    return buildSingleBatch(capcode, functionBits, message);
+  }
+
  private:
   void appendPreamble(std::vector<uint8_t> &bits, uint32_t preambleMs,
                       uint32_t baud) const {
@@ -124,7 +129,7 @@ class PocsagEncoder {
     bits.reserve(message.length() * 7);
     for (size_t i = 0; i < message.length(); ++i) {
       uint8_t value = static_cast<uint8_t>(message[i]) & 0x7F;
-      for (int b = 6; b >= 0; --b) {
+      for (int b = 0; b < 7; ++b) {
         bits.push_back(static_cast<uint8_t>((value >> b) & 0x1));
       }
     }
@@ -150,25 +155,19 @@ class PocsagEncoder {
     uint32_t address = capcode >> 3;
     uint32_t data = (address & 0x3FFFF) << 2;
     data |= (functionBits & 0x3);
-    return buildCodeword(0, data);
+    uint32_t msg21 = data & 0x1FFFFF;
+    return encodeCodeword(msg21);
   }
 
   uint32_t buildMessageWord(uint32_t data20) const {
-    return buildCodeword(1, data20 & 0xFFFFF);
+    uint32_t msg21 = (1u << 20) | (data20 & 0xFFFFF);
+    return encodeCodeword(msg21);
   }
 
-  uint32_t buildCodeword(uint8_t typeBit, uint32_t data) const {
-    uint32_t data21 = (static_cast<uint32_t>(typeBit) << 20) | (data & 0xFFFFF);
-    uint32_t bch = bchEncode(data21);
-    uint32_t word = (data21 << 11) | (bch << 1);
-    uint32_t parity = computeParity(word);
-    return word | parity;
-  }
-
-  uint32_t bchEncode(uint32_t data21) const {
-    uint32_t reg = data21 << 10;
+  uint32_t crc(uint32_t msg21) const {
+    uint32_t reg = msg21 << 10;
     constexpr uint32_t poly = 0x3B9;
-    for (int i = 31; i >= 10; --i) {
+    for (int i = 30; i >= 10; --i) {
       if (reg & (1u << i)) {
         reg ^= (poly << (i - 10));
       }
@@ -176,13 +175,20 @@ class PocsagEncoder {
     return reg & 0x3FF;
   }
 
-  uint32_t computeParity(uint32_t value) const {
-    uint32_t parity = 0;
+  uint32_t parity(uint32_t value) const {
+    uint32_t bit = 0;
     while (value) {
-      parity ^= (value & 1u);
+      bit ^= (value & 1u);
       value >>= 1;
     }
-    return parity & 0x1;
+    return bit & 0x1;
+  }
+
+  uint32_t encodeCodeword(uint32_t msg21) const {
+    uint32_t remainder = crc(msg21);
+    uint32_t word = (msg21 << 11) | (remainder << 1);
+    uint32_t parityBit = parity(word);
+    return word | parityBit;
   }
 };
 
@@ -504,6 +510,18 @@ static void printStatus() {
       config.dataGpio, config.frameGapMs, config.repeatPreambleEachFrame ? "true" : "false");
 }
 
+static void printQuickHelp() {
+  Serial.println("Quick help:");
+  Serial.println("  STATUS | HELP | SCOPE <ms> | H | T1 <sec> | DIAG <msg> [capcode]");
+  Serial.println("  SET <key> <value> | SAVE | LOAD | ADDR <sec> [IND|GRP|BOTH]");
+  Serial.println("Examples:");
+  Serial.println("  STATUS");
+  Serial.println("  SCOPE 2000");
+  Serial.println("  H");
+  Serial.println("  T1 10");
+  Serial.println("  DIAG H");
+}
+
 static std::vector<uint8_t> buildAlternatingBits(uint32_t durationMs, uint32_t baud) {
   uint32_t bitCount = (durationMs * baud) / 1000;
   if (bitCount == 0) {
@@ -560,6 +578,18 @@ static uint32_t clampFrameGap(uint32_t gap) {
     return kMaxFrameGapMs;
   }
   return gap;
+}
+
+static bool isDigits(const String &value) {
+  if (value.length() == 0) {
+    return false;
+  }
+  for (size_t i = 0; i < value.length(); ++i) {
+    if (!isDigit(static_cast<unsigned char>(value[i]))) {
+      return false;
+    }
+  }
+  return true;
 }
 
 static void runMessageLoop(uint32_t seconds, const String &message, uint32_t capcode) {
@@ -657,6 +687,7 @@ static void printHelp() {
   Serial.println("  T1 <sec>               - loop HELLO WORLD for <sec>");
   Serial.println("  ADDR <sec> [IND|GRP|BOTH] - address-only loop");
   Serial.println("  SCOPE <ms>             - output 1010 pattern for scope");
+  Serial.println("  DIAG <msg> [capcode]   - print generated codewords");
   Serial.println("  HELP or ?              - show this menu");
   Serial.println("SET keys: baud invert idleHigh output preambleMs capInd capGrp functionBits dataGpio");
   Serial.println("          frameGapMs repeatPreambleEachFrame");
@@ -668,6 +699,7 @@ static void printHelp() {
   Serial.println("  T1 10");
   Serial.println("  ADDR 10 IND");
   Serial.println("  H");
+  Serial.println("  DIAG H");
   Serial.println("  SAVE");
 }
 
@@ -733,6 +765,42 @@ static void handleCommand(const String &line) {
     applyPreset(value, true);
     return;
   }
+  if (cmd == "DIAG") {
+    String remainder = (space < 0) ? "" : trimmed.substring(space + 1);
+    remainder.trim();
+    String message = remainder;
+    uint32_t capcode = config.capInd;
+    if (remainder.length() == 0) {
+      message = "H";
+    } else {
+      int lastSpace = remainder.lastIndexOf(' ');
+      if (lastSpace > 0) {
+        String maybeCap = remainder.substring(lastSpace + 1);
+        maybeCap.trim();
+        String maybeMsg = remainder.substring(0, lastSpace);
+        maybeMsg.trim();
+        if (isDigits(maybeCap)) {
+          capcode = static_cast<uint32_t>(maybeCap.toInt());
+          message = (maybeMsg.length() > 0) ? maybeMsg : "H";
+        }
+      } else if (isDigits(remainder)) {
+        capcode = static_cast<uint32_t>(remainder.toInt());
+        message = "H";
+      }
+    }
+    String outputMode = (config.output == OutputMode::kOpenDrain) ? "open_drain" : "push_pull";
+    Serial.printf(
+        "baud=%u invert=%s idleHigh=%s output=%s dataGpio=%d preambleMs=%u capcode=%u functionBits=%u\n",
+        config.baud, config.invert ? "true" : "false", config.idleHigh ? "true" : "false",
+        outputMode.c_str(), config.dataGpio, config.preambleMs, capcode, config.functionBits);
+    Serial.printf("SYNC: %08lX\n", static_cast<unsigned long>(kSyncWord));
+    std::vector<uint32_t> batch = encoder.buildBatchWords(capcode, config.functionBits, message);
+    for (size_t i = 0; i < batch.size(); ++i) {
+      Serial.printf("W%02u: %08lX\n", static_cast<unsigned int>(i),
+                    static_cast<unsigned long>(batch[i]));
+    }
+    return;
+  }
   if (cmd == "HELP" || cmd == "?") {
     printHelp();
     return;
@@ -760,6 +828,7 @@ void setup() {
   }
   setIdleLine();
   Serial.println("POCSAG TX ready. Type HELP or ? for commands.");
+  printQuickHelp();
   if (!config.firstBootShown) {
     printHelp();
     config.firstBootShown = true;
