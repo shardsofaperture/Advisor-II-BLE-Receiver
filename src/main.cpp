@@ -4,6 +4,8 @@
 #include <vector>
 
 #include "driver/rmt.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 namespace {
 constexpr const char *kConfigPath = "/config.json";
@@ -25,6 +27,7 @@ struct Config {
   bool invertWords = false;
   bool driveOneLow = true;
   bool idleHigh = true;
+  bool blockingTx = true;
   String bootPreset = "ADVISOR";
   bool firstBootShown = false;
 };
@@ -38,7 +41,10 @@ class WaveTx {
   bool isBusy() const { return busy_; }
 
   bool transmitBits(const std::vector<uint8_t> &bits, uint32_t baud, int gpio,
-                    OutputMode output, bool idleHigh, bool driveOneLow) {
+                    OutputMode output, bool idleHigh, bool driveOneLow, bool blockingTx) {
+    if (busy_) {
+      refreshBusy();
+    }
     if (busy_) {
       return false;
     }
@@ -56,11 +62,38 @@ class WaveTx {
       return true;
     }
     busy_ = true;
-    rmt_write_items(channel_, items_.data(), items_.size(), true);
-    rmt_wait_tx_done(channel_, portMAX_DELAY);
+    esp_err_t err = rmt_write_items(channel_, items_.data(), items_.size(), false);
+    if (err != ESP_OK) {
+      busy_ = false;
+      setIdleLine(gpio, output, idleHigh);
+      return false;
+    }
+    if (!blockingTx) {
+      return true;
+    }
+    uint32_t txMs = static_cast<uint32_t>((bits.size() * 1000ULL) / baud) + 250;
+    err = rmt_wait_tx_done(channel_, pdMS_TO_TICKS(txMs));
+    if (err != ESP_OK) {
+      rmt_tx_stop(channel_);
+      busy_ = false;
+      setIdleLine(gpio, output, idleHigh);
+      Serial.println("ERR: RMT TX TIMEOUT");
+      return false;
+    }
     busy_ = false;
     setIdleLine(gpio, output, idleHigh);
     return true;
+  }
+
+  bool refreshBusy() {
+    if (!busy_ || !initialized_) {
+      return busy_;
+    }
+    if (rmt_wait_tx_done(channel_, 0) == ESP_OK) {
+      busy_ = false;
+      setIdleLine(gpio_, output_, idleHigh_);
+    }
+    return busy_;
   }
 
  private:
@@ -397,6 +430,7 @@ static void writeConfigFile() {
   file.printf("  \"invertWords\": %s,\n", config.invertWords ? "true" : "false");
   file.printf("  \"driveOneLow\": %s,\n", config.driveOneLow ? "true" : "false");
   file.printf("  \"idleHigh\": %s,\n", config.idleHigh ? "true" : "false");
+  file.printf("  \"blockingTx\": %s,\n", config.blockingTx ? "true" : "false");
   file.printf("  \"bootPreset\": \"%s\",\n", config.bootPreset.c_str());
   file.printf("  \"firstBootShown\": %s\n", config.firstBootShown ? "true" : "false");
   file.println("}");
@@ -438,6 +472,9 @@ static bool loadConfig() {
   }
   if (extractJsonValue(json, "idleHigh", value)) {
     parseBool(value, config.idleHigh);
+  }
+  if (extractJsonValue(json, "blockingTx", value)) {
+    parseBool(value, config.blockingTx);
   }
   if (extractJsonValue(json, "output", value)) {
     parseOutputMode(value, config.output);
@@ -593,7 +630,7 @@ static std::vector<uint8_t> buildMinimalPocsagBits(uint32_t capcode, uint8_t fun
 static bool sendMessageOnce(const String &message, uint32_t capcode) {
   std::vector<uint8_t> bits = buildPocsagBits(message, capcode, config.preambleBits);
   if (!waveTx.transmitBits(bits, config.baud, config.dataGpio, config.output, config.idleHigh,
-                           config.driveOneLow)) {
+                           config.driveOneLow, config.blockingTx)) {
     Serial.println("TX_BUSY");
     return false;
   }
@@ -603,7 +640,7 @@ static bool sendMessageOnce(const String &message, uint32_t capcode) {
 static void handleScope(uint32_t durationMs) {
   std::vector<uint8_t> bits = buildAlternatingBits(durationMs, config.baud);
   if (!waveTx.transmitBits(bits, config.baud, config.dataGpio, config.output, config.idleHigh,
-                           config.driveOneLow)) {
+                           config.driveOneLow, config.blockingTx)) {
     Serial.println("TX_BUSY");
     return;
   }
@@ -615,7 +652,7 @@ static void handleDebugScope() {
       buildIdleBits(2000, config.baud, config.driveOneLow, config.idleHigh);
   bits.insert(bits.end(), idleBits.begin(), idleBits.end());
   if (!waveTx.transmitBits(bits, config.baud, config.dataGpio, config.output, config.idleHigh,
-                           config.driveOneLow)) {
+                           config.driveOneLow, config.blockingTx)) {
     Serial.println("TX_BUSY");
   }
 }
@@ -623,7 +660,7 @@ static void handleDebugScope() {
 static void handleSendMin(uint32_t capcode, uint8_t functionBits) {
   std::vector<uint8_t> bits = buildMinimalPocsagBits(capcode, functionBits, 2000);
   if (!waveTx.transmitBits(bits, config.baud, config.dataGpio, config.output, config.idleHigh,
-                           config.driveOneLow)) {
+                           config.driveOneLow, config.blockingTx)) {
     Serial.println("TX_BUSY");
   }
 }
@@ -656,6 +693,8 @@ static void applySetCommand(const String &key, const String &value) {
     parseBool(value, config.invertWords);
   } else if (normalizedKey == "driveonelow") {
     parseBool(value, config.driveOneLow);
+  } else if (normalizedKey == "blockingtx") {
+    parseBool(value, config.blockingTx);
   } else if (normalizedKey == "capind") {
     config.capInd = static_cast<uint32_t>(value.toInt());
   } else if (normalizedKey == "capgrp") {
@@ -682,11 +721,11 @@ static void printHelp() {
   Serial.println("POCSAG TX (RMT) Commands:");
   Serial.println(
       "  STATUS | HELP | ? | PRESET <name> | SCOPE <ms> | DEBUG_SCOPE | H | SEND <text> | "
-      "SEND_MIN <capcode> <func> | T1 <sec>");
+      "SEND_MIN <capcode> [func] | STATUS_TX | T1 <sec>");
   Serial.println("  SET <key> <value> | SAVE | LOAD");
   Serial.println("Presets: ADVISOR | GENERIC");
   Serial.println("SET keys: baud preambleBits capInd capGrp functionBits dataGpio output");
-  Serial.println("          invertWords driveOneLow idleHigh");
+  Serial.println("          invertWords driveOneLow idleHigh blockingTx");
   Serial.println("Examples:");
   Serial.println("  PRESET ADVISOR");
   Serial.println("  STATUS");
@@ -694,7 +733,7 @@ static void printHelp() {
   Serial.println("  DEBUG_SCOPE");
   Serial.println("  H");
   Serial.println("  SEND HELLO WORLD");
-  Serial.println("  SEND_MIN 1422890 0");
+  Serial.println("  SEND_MIN 1422890 2");
   Serial.println("  T1 10");
   Serial.println(
       "ADVISOR preset: baud=512 invertWords=false driveOneLow=true idleHigh=true output=push_pull");
@@ -718,6 +757,10 @@ static void handleCommand(const String &line) {
 
   if (cmd == "STATUS") {
     printStatus();
+    return;
+  }
+  if (cmd == "STATUS_TX") {
+    Serial.println(waveTx.refreshBusy() ? "TX_BUSY" : "TX_IDLE");
     return;
   }
   if (cmd == "SAVE") {
@@ -755,13 +798,18 @@ static void handleCommand(const String &line) {
     return;
   }
   if (cmd == "SEND_MIN") {
-    int secondSpace = trimmed.indexOf(' ', space + 1);
-    if (space < 0 || secondSpace < 0) {
-      Serial.println("ERR: SEND_MIN <capcode> <func>");
+    if (space < 0) {
+      Serial.println("ERR: SEND_MIN <capcode> [func]");
       return;
     }
-    uint32_t capcode = static_cast<uint32_t>(trimmed.substring(space + 1, secondSpace).toInt());
-    uint8_t functionBits = static_cast<uint8_t>(trimmed.substring(secondSpace + 1).toInt() & 0x3);
+    int secondSpace = trimmed.indexOf(' ', space + 1);
+    String capcodeValue =
+        (secondSpace < 0) ? trimmed.substring(space + 1) : trimmed.substring(space + 1, secondSpace);
+    uint32_t capcode = static_cast<uint32_t>(capcodeValue.toInt());
+    uint8_t functionBits = 2;
+    if (secondSpace >= 0) {
+      functionBits = static_cast<uint8_t>(trimmed.substring(secondSpace + 1).toInt() & 0x3);
+    }
     handleSendMin(capcode, functionBits);
     return;
   }
