@@ -2,6 +2,7 @@
 
 This firmware outputs a deterministic POCSAG NRZ stream on an ESP32-S3 GPIO for scope validation
 and pager injection. Configuration is stored in LittleFS at `/config.json`.
+Alpha packing and BCH/CRC parity now match AdvisorRadio.ino for bit-for-bit comparison.
 
 ## Quick start
 ### Wiring
@@ -24,6 +25,7 @@ On first boot the device prints **HELP** automatically so the README is optional
 - `T1 <seconds>` (repeat `HELLO WORLD`)
 - `ADDR <seconds> [IND|GRP|BOTH]` (address-only burst loop)
 - `SCOPE <ms>`
+- `DIAG <msg> [capcode]` (print generated codewords for comparison)
 - `HELP` / `?`
 
 ### SET keys
@@ -43,4 +45,14 @@ On first boot the device prints **HELP** automatically so the README is optional
 ```bash
 platformio run -t upload
 platformio device monitor
+```
+
+## DIAG usage
+`DIAG` prints the sync word and the 16 batch codewords so you can compare output against
+AdvisorRadio.ino or the LoRa sketch.
+
+Example:
+```
+DIAG H
+DIAG HELLO 1234567
 ```
