@@ -5,22 +5,22 @@ Configuration lives in LittleFS at `/config.json`.
 
 ## How to wire
 - ESP32 GND → pager battery negative / ground
-- XIAO ESP32S3 **D3** (GPIO4) → series resistor (start 1k–2.2k; 470 Ω OK) → pager header pin 4
+- XIAO ESP32S3 **D3** (GPIO4) → 480 Ω series resistor → pager header pin 4
 - D3 on the XIAO ESP32S3 maps to GPIO4.
-- Keep the pager’s own pull-up/biasing. Start with `output open_drain`; if no decode, try
-  `output push_pull`.
+- Share ground between the ESP32 and pager.
+- Default output mode is `push_pull` for reliable paging.
 
 ## Quick start
 1. Flash the firmware.
 2. Open Serial Monitor @ 115200.
-3. `PRESET ADVISOR`
-4. `STATUS`
-5. `SCOPE 2000` (verify timing)
-6. `H`
-7. Known-good baseline: `PRESET ADVISOR` then `H`.
+3. `STATUS`
+4. `DEBUG_SCOPE` (verify deterministic timing)
+5. `SEND_MIN 1422890 0`
+
+Defaults: baud=512, invert=1 (driveOneLow), idleHigh=1, output=push_pull.
 
 ## If scope looks good but pager still doesn’t decode
-- Toggle `SET output open_drain` vs `SET output push_pull`.
+- Toggle `SET output open_drain` vs `SET output push_pull` (open-drain needs an external pull-up).
 - Toggle `SET driveOneLow true/false`.
 - Toggle `SET invertWords true/false`.
 - Try `SET preambleBits 576` vs `SET preambleBits 1024`.
@@ -36,6 +36,8 @@ Configuration lives in LittleFS at `/config.json`.
 - `SEND <text>` (send arbitrary text)
 - `T1 <seconds>` (repeat `HELLO WORLD`)
 - `SCOPE <ms>`
+- `DEBUG_SCOPE`
+- `SEND_MIN <capcode> <func>`
 - `HELP` / `?`
 
 ### SET keys
