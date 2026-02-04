@@ -21,7 +21,7 @@ struct Config {
   uint32_t capGrp = 1422890;
   uint8_t functionBits = 2;
   int dataGpio = 4;
-  OutputMode output = OutputMode::kOpenDrain;
+  OutputMode output = OutputMode::kPushPull;
   bool invertWords = true;
   bool driveOneLow = true;
   bool idleHigh = true;
@@ -97,6 +97,12 @@ class WaveTx {
   }
 
   void buildItems(const std::vector<uint8_t> &bits, uint32_t bitPeriodUs, bool driveOneLow) {
+    // RMT timing note:
+    // - With clk_div=80, each RMT tick is 1 us (80 MHz / 80).
+    // - At 512 bps, bitPeriodUs is 1953 us. Each bit is represented by a single
+    //   constant-level item whose duration equals the bit period.
+    // - driveOneLow=true inverts the NRZ line mapping (bit=1 -> low, bit=0 -> high).
+    // - idleHigh configures the idle line state after the RMT stream completes.
     items_.clear();
     if (bits.empty()) {
       return;
@@ -154,6 +160,10 @@ class PocsagEncoder {
   std::vector<uint32_t> buildBatchWords(uint32_t capcode, uint8_t functionBits,
                                         const String &message) const {
     return buildSingleBatch(capcode, functionBits, message);
+  }
+
+  uint32_t buildAddressCodeword(uint32_t capcode, uint8_t functionBits) const {
+    return buildAddressWord(capcode, functionBits);
   }
 
  private:
@@ -340,7 +350,7 @@ static bool applyPreset(const String &name, bool report) {
     config.capGrp = 1422890;
     config.functionBits = 2;
     config.dataGpio = 4;
-    config.output = OutputMode::kOpenDrain;
+    config.output = OutputMode::kPushPull;
     config.invertWords = true;
     config.driveOneLow = true;
     config.idleHigh = true;
@@ -351,7 +361,7 @@ static bool applyPreset(const String &name, bool report) {
     config.capGrp = 1422890;
     config.functionBits = 0;
     config.dataGpio = 4;
-    config.output = OutputMode::kOpenDrain;
+    config.output = OutputMode::kPushPull;
     config.invertWords = false;
     config.driveOneLow = false;
     config.idleHigh = true;
@@ -504,6 +514,21 @@ static std::vector<uint8_t> buildAlternatingBits(uint32_t durationMs, uint32_t b
   return bits;
 }
 
+static std::vector<uint8_t> buildIdleBits(uint32_t durationMs, uint32_t baud, bool driveOneLow,
+                                          bool idleHigh) {
+  uint32_t bitCount = (durationMs * baud) / 1000;
+  if (bitCount == 0) {
+    bitCount = 1;
+  }
+  uint8_t idleBit = 0;
+  if (driveOneLow) {
+    idleBit = idleHigh ? 0 : 1;
+  } else {
+    idleBit = idleHigh ? 1 : 0;
+  }
+  return std::vector<uint8_t>(bitCount, idleBit);
+}
+
 static void applyWordInversion(std::vector<uint32_t> &words, bool invertWords) {
   if (!invertWords) {
     return;
@@ -511,6 +536,17 @@ static void applyWordInversion(std::vector<uint32_t> &words, bool invertWords) {
   for (uint32_t &word : words) {
     word = ~word;
   }
+}
+
+static std::vector<uint32_t> buildMinimalBatch(uint32_t capcode, uint8_t functionBits) {
+  std::vector<uint32_t> words(16, kIdleWord);
+  uint8_t frame = static_cast<uint8_t>(capcode & 0x7);
+  uint32_t addressWord = encoder.buildAddressCodeword(capcode, functionBits);
+  size_t index = frame * 2;
+  if (index < words.size()) {
+    words[index] = addressWord;
+  }
+  return words;
 }
 
 static std::vector<uint8_t> buildPocsagBits(const String &message, uint32_t capcode,
@@ -524,6 +560,23 @@ static std::vector<uint8_t> buildPocsagBits(const String &message, uint32_t capc
     }
   }
   words = encoder.buildBatchWords(capcode, config.functionBits, message);
+  applyWordInversion(words, config.invertWords);
+  uint32_t syncWord = config.invertWords ? ~kSyncWord : kSyncWord;
+  for (int i = 31; i >= 0; --i) {
+    bits.push_back(static_cast<uint8_t>((syncWord >> i) & 0x1));
+  }
+  for (uint32_t word : words) {
+    for (int i = 31; i >= 0; --i) {
+      bits.push_back(static_cast<uint8_t>((word >> i) & 0x1));
+    }
+  }
+  return bits;
+}
+
+static std::vector<uint8_t> buildMinimalPocsagBits(uint32_t capcode, uint8_t functionBits,
+                                                   uint32_t preambleMs) {
+  std::vector<uint8_t> bits = buildAlternatingBits(preambleMs, config.baud);
+  std::vector<uint32_t> words = buildMinimalBatch(capcode, functionBits);
   applyWordInversion(words, config.invertWords);
   uint32_t syncWord = config.invertWords ? ~kSyncWord : kSyncWord;
   for (int i = 31; i >= 0; --i) {
@@ -553,6 +606,25 @@ static void handleScope(uint32_t durationMs) {
                            config.driveOneLow)) {
     Serial.println("TX_BUSY");
     return;
+  }
+}
+
+static void handleDebugScope() {
+  std::vector<uint8_t> bits = buildAlternatingBits(2000, config.baud);
+  std::vector<uint8_t> idleBits =
+      buildIdleBits(2000, config.baud, config.driveOneLow, config.idleHigh);
+  bits.insert(bits.end(), idleBits.begin(), idleBits.end());
+  if (!waveTx.transmitBits(bits, config.baud, config.dataGpio, config.output, config.idleHigh,
+                           config.driveOneLow)) {
+    Serial.println("TX_BUSY");
+  }
+}
+
+static void handleSendMin(uint32_t capcode, uint8_t functionBits) {
+  std::vector<uint8_t> bits = buildMinimalPocsagBits(capcode, functionBits, 2000);
+  if (!waveTx.transmitBits(bits, config.baud, config.dataGpio, config.output, config.idleHigh,
+                           config.driveOneLow)) {
+    Serial.println("TX_BUSY");
   }
 }
 
@@ -608,7 +680,9 @@ static void applySetCommand(const String &key, const String &value) {
 
 static void printHelp() {
   Serial.println("POCSAG TX (RMT) Commands:");
-  Serial.println("  STATUS | HELP | ? | PRESET <name> | SCOPE <ms> | H | SEND <text> | T1 <sec>");
+  Serial.println(
+      "  STATUS | HELP | ? | PRESET <name> | SCOPE <ms> | DEBUG_SCOPE | H | SEND <text> | "
+      "SEND_MIN <capcode> <func> | T1 <sec>");
   Serial.println("  SET <key> <value> | SAVE | LOAD");
   Serial.println("Presets: ADVISOR | GENERIC");
   Serial.println("SET keys: baud preambleBits capInd capGrp functionBits dataGpio output");
@@ -617,8 +691,10 @@ static void printHelp() {
   Serial.println("  PRESET ADVISOR");
   Serial.println("  STATUS");
   Serial.println("  SCOPE 2000");
+  Serial.println("  DEBUG_SCOPE");
   Serial.println("  H");
   Serial.println("  SEND HELLO WORLD");
+  Serial.println("  SEND_MIN 1422890 0");
   Serial.println("  T1 10");
   Serial.printf(
       "Defaults: baud=%u preambleBits=%u output=%s dataGpio=%d invertWords=%s driveOneLow=%s idleHigh=%s\n",
@@ -662,6 +738,10 @@ static void handleCommand(const String &line) {
     handleScope(static_cast<uint32_t>(value.toInt()));
     return;
   }
+  if (cmd == "DEBUG_SCOPE") {
+    handleDebugScope();
+    return;
+  }
   if (cmd == "SEND") {
     String message = (space < 0) ? "" : trimmed.substring(space + 1);
     message.trim();
@@ -670,6 +750,17 @@ static void handleCommand(const String &line) {
       return;
     }
     sendMessageOnce(message, config.capInd);
+    return;
+  }
+  if (cmd == "SEND_MIN") {
+    int secondSpace = trimmed.indexOf(' ', space + 1);
+    if (space < 0 || secondSpace < 0) {
+      Serial.println("ERR: SEND_MIN <capcode> <func>");
+      return;
+    }
+    uint32_t capcode = static_cast<uint32_t>(trimmed.substring(space + 1, secondSpace).toInt());
+    uint8_t functionBits = static_cast<uint8_t>(trimmed.substring(secondSpace + 1).toInt() & 0x3);
+    handleSendMin(capcode, functionBits);
     return;
   }
   if (cmd == "T1") {
