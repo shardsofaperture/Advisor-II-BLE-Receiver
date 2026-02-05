@@ -13,6 +13,7 @@ constexpr const char *kConfigPath = "/config.json";
 constexpr uint32_t kSyncWord = 0x7CD215D8;
 constexpr uint32_t kIdleWord = 0x7A89C197;
 constexpr uint32_t kMaxRmtDuration = 32767;
+constexpr size_t kMaxRmtItems = 2000;
 }
 
 enum class OutputMode : uint8_t { kOpenDrain = 0, kPushPull = 1 };
@@ -36,6 +37,12 @@ struct Config {
 static Config config;
 
 static void printStatus();
+static void printErr(const char *tag, esp_err_t err) {
+  if (err == ESP_OK) {
+    return;
+  }
+  Serial.printf("ERR %s: 0x%X\n", tag, static_cast<unsigned int>(err));
+}
 
 struct TxJob {
   std::vector<uint8_t> bits;
@@ -61,27 +68,33 @@ class WaveTx {
       setIdleLine(gpio, output, idleHigh);
       return true;
     }
-    if (!ensureConfig(gpio, output, idleHigh)) {
-      return false;
-    }
     uint32_t bitPeriodUs = (1000000 + (baud / 2)) / baud;
     buildItems(bits, bitPeriodUs, driveOneLow);
     if (items_.empty()) {
       setIdleLine(gpio, output, idleHigh);
       return true;
     }
-    busy_ = true;
-    esp_err_t err = rmt_write_items(channel_, items_.data(), items_.size(), blockingTx);
-    if (err != ESP_OK) {
-      busy_ = false;
-      setIdleLine(gpio, output, idleHigh);
+    if (initialized_) {
+      rmt_tx_stop(channel_);
+      rmt_driver_uninstall(channel_);
+      initialized_ = false;
+    }
+    if (!ensureConfig(gpio, output, idleHigh)) {
       return false;
     }
-    if (!blockingTx) {
-      return true;
+    busy_ = true;
+    (void)blockingTx;
+    esp_err_t err = rmt_write_items(channel_, items_.data(), items_.size(), true);
+    printErr("rmt_write_items", err);
+    rmt_tx_stop(channel_);
+    rmt_driver_uninstall(channel_);
+    initialized_ = false;
+    setIdleLine(gpio, output, idleHigh);
+    if (err != ESP_OK) {
+      busy_ = false;
+      return false;
     }
     busy_ = false;
-    setIdleLine(gpio, output, idleHigh);
     return true;
   }
 
@@ -102,16 +115,20 @@ class WaveTx {
     config.rmt_mode = RMT_MODE_TX;
     config.channel = channel_;
     config.gpio_num = static_cast<gpio_num_t>(gpio_);
-    config.mem_block_num = 1;
+    config.mem_block_num = 4;
     config.clk_div = 80;
     config.tx_config.loop_en = false;
     config.tx_config.carrier_en = false;
     config.tx_config.idle_output_en = true;
     config.tx_config.idle_level = idleHigh_ ? RMT_IDLE_LEVEL_HIGH : RMT_IDLE_LEVEL_LOW;
-    if (rmt_config(&config) != ESP_OK) {
+    esp_err_t err = rmt_config(&config);
+    printErr("rmt_config", err);
+    if (err != ESP_OK) {
       return false;
     }
-    if (rmt_driver_install(channel_, 0, 0) != ESP_OK) {
+    err = rmt_driver_install(channel_, 0, 0);
+    printErr("rmt_driver_install", err);
+    if (err != ESP_OK) {
       return false;
     }
     initialized_ = true;
@@ -153,6 +170,12 @@ class WaveTx {
           item.level1 = levelHigh;
         }
         items_.push_back(item);
+        if (items_.size() > kMaxRmtItems) {
+          Serial.printf("ERR: items too many: %u\n",
+                        static_cast<unsigned int>(items_.size()));
+          items_.clear();
+          return;
+        }
         totalDuration -= chunk;
       }
       index += runLength;
