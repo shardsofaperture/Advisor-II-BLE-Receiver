@@ -55,9 +55,6 @@ class WaveTx {
   bool transmitBits(const std::vector<uint8_t> &bits, uint32_t baud, int gpio,
                     OutputMode output, bool idleHigh, bool driveOneLow, bool blockingTx) {
     if (busy_) {
-      refreshBusy();
-    }
-    if (busy_) {
       return false;
     }
     if (bits.empty()) {
@@ -73,10 +70,8 @@ class WaveTx {
       setIdleLine(gpio, output, idleHigh);
       return true;
     }
-    txStartMs_ = millis();
-    txTimeoutMs_ = static_cast<uint32_t>((bits.size() * 1000ULL) / baud) + 500;
     busy_ = true;
-    esp_err_t err = rmt_write_items(channel_, items_.data(), items_.size(), false);
+    esp_err_t err = rmt_write_items(channel_, items_.data(), items_.size(), blockingTx);
     if (err != ESP_OK) {
       busy_ = false;
       setIdleLine(gpio, output, idleHigh);
@@ -85,39 +80,9 @@ class WaveTx {
     if (!blockingTx) {
       return true;
     }
-    uint32_t txMs = static_cast<uint32_t>((bits.size() * 1000ULL) / baud) + 250;
-    err = rmt_wait_tx_done(channel_, pdMS_TO_TICKS(txMs));
-    if (err != ESP_OK) {
-      rmt_tx_stop(channel_);
-      rmt_driver_uninstall(channel_);
-      initialized_ = false;
-      busy_ = false;
-      setIdleLine(gpio, output, idleHigh);
-      return false;
-    }
     busy_ = false;
     setIdleLine(gpio, output, idleHigh);
     return true;
-  }
-
-  bool refreshBusy() {
-    if (!busy_ || !initialized_) {
-      return busy_;
-    }
-    if ((millis() - txStartMs_) > txTimeoutMs_) {
-      rmt_tx_stop(channel_);
-      rmt_driver_uninstall(channel_);
-      initialized_ = false;
-      busy_ = false;
-      setIdleLine(gpio_, output_, idleHigh_);
-      Serial.println("ERR: RMT STUCK, RESET");
-      return busy_;
-    }
-    if (rmt_wait_tx_done(channel_, 0) == ESP_OK) {
-      busy_ = false;
-      setIdleLine(gpio_, output_, idleHigh_);
-    }
-    return busy_;
   }
 
  private:
@@ -206,8 +171,6 @@ class WaveTx {
   rmt_channel_t channel_ = RMT_CHANNEL_0;
   bool initialized_ = false;
   bool busy_ = false;
-  uint32_t txStartMs_ = 0;
-  uint32_t txTimeoutMs_ = 0;
   int gpio_ = -1;
   OutputMode output_ = OutputMode::kOpenDrain;
   bool idleHigh_ = true;
@@ -316,6 +279,7 @@ class PocsagEncoder {
 
 static PocsagEncoder encoder;
 static WaveTx waveTx;
+static volatile bool gWorkerBusy = false;
 
 static void txWorkerTask(void *context) {
   (void)context;
@@ -324,8 +288,11 @@ static void txWorkerTask(void *context) {
     if (xQueueReceive(txQueue, &job, portMAX_DELAY) != pdTRUE || job == nullptr) {
       continue;
     }
-    waveTx.transmitBits(job->bits, job->baud, job->gpio, job->output, job->idleHigh,
-                        job->driveOneLow, true);
+    gWorkerBusy = true;
+    bool ok = waveTx.transmitBits(job->bits, job->baud, job->gpio, job->output, job->idleHigh,
+                                  job->driveOneLow, true);
+    gWorkerBusy = false;
+    Serial.println(ok ? "TX_DONE" : "TX_FAIL");
     delete job;
   }
 }
@@ -723,7 +690,7 @@ static bool queueTxJob(const std::vector<uint8_t> &bits) {
     Serial.println("ERR: TX_QUEUE");
     return false;
   }
-  if (waveTx.refreshBusy() || uxQueueSpacesAvailable(txQueue) == 0) {
+  if (gWorkerBusy || uxQueueSpacesAvailable(txQueue) == 0) {
     Serial.println("TX_BUSY");
     return false;
   }
@@ -739,31 +706,16 @@ static bool queueTxJob(const std::vector<uint8_t> &bits) {
 }
 
 static bool sendMessageOnce(const String &message, uint32_t capcode) {
-  waveTx.refreshBusy();
-  if (waveTx.isBusy()) {
-    Serial.println("TX_BUSY");
-    return false;
-  }
   std::vector<uint8_t> bits = buildRepeatedPocsagBits(message, capcode, config.preambleBits, 3000);
   return queueTxJob(bits);
 }
 
 static void handleScope(uint32_t durationMs) {
-  waveTx.refreshBusy();
-  if (waveTx.isBusy()) {
-    Serial.println("TX_BUSY");
-    return;
-  }
   std::vector<uint8_t> bits = buildAlternatingBits(durationMs, config.baud);
   queueTxJob(bits);
 }
 
 static void handleDebugScope() {
-  waveTx.refreshBusy();
-  if (waveTx.isBusy()) {
-    Serial.println("TX_BUSY");
-    return;
-  }
   std::vector<uint8_t> bits = buildAlternatingBits(2000, config.baud);
   std::vector<uint8_t> idleBits =
       buildIdleBits(2000, config.baud, config.driveOneLow, config.idleHigh);
@@ -772,11 +724,6 @@ static void handleDebugScope() {
 }
 
 static void handleSendMin(uint32_t capcode, uint8_t functionBits, uint32_t repeatMs) {
-  waveTx.refreshBusy();
-  if (waveTx.isBusy()) {
-    Serial.println("TX_BUSY");
-    return;
-  }
   std::vector<uint8_t> bits = buildRepeatedMinimalBits(capcode, functionBits, 2000, repeatMs);
   queueTxJob(bits);
 }
@@ -880,7 +827,6 @@ static void printHelp() {
 }
 
 static void handleCommand(const String &line) {
-  waveTx.refreshBusy();
   String trimmed = line;
   trimmed.trim();
   if (trimmed.length() == 0) {
@@ -895,10 +841,7 @@ static void handleCommand(const String &line) {
     return;
   }
   if (cmd == "STATUS_TX") {
-    bool busy = waveTx.refreshBusy();
-    if (txQueue && uxQueueMessagesWaiting(txQueue) > 0) {
-      busy = true;
-    }
+    bool busy = gWorkerBusy || (txQueue && uxQueueMessagesWaiting(txQueue) > 0);
     Serial.println(busy ? "TX_BUSY" : "TX_IDLE");
     return;
   }
@@ -1027,7 +970,6 @@ void setup() {
 }
 
 void loop() {
-  waveTx.refreshBusy();
   static String lineBuffer;
   while (Serial.available() > 0) {
     char c = static_cast<char>(Serial.read());
