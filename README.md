@@ -76,8 +76,9 @@ output=push_pull.
 - Use `PING` to receive `PONG\n` on the status characteristic.
 
 ## Android automation assets
-Android automation assets live in `android-tools/`.
+Android automation assets for PagerBLE live in `assets/android/tasker/`.
 
-- Import the Tasker project export: `android-tools/tasker/SmstoPager.prj.xml`.
-- Required plugins/apps are documented in `android-tools/README.md`.
-- Variable definitions and debugging steps are in `android-tools/tasker/variables.md` and `android-tools/tasker/troubleshooting.md`.
+- Canonical Tasker project export: `assets/android/tasker/PagerBLE.prj.xml`
+- Legacy duplicate export: `assets/android/tasker/SmstoPager.prj.xml`
+- Known-good constants: `assets/android/tasker/known-good-values.txt`
+- Full setup and troubleshooting guide: `docs/android-tasker.md`
