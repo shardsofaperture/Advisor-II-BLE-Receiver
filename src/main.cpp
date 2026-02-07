@@ -377,9 +377,8 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
 class ServerCallbacks : public NimBLEServerCallbacks {
  public:
   void onConnect(NimBLEServer *server, ble_gap_conn_desc *desc) override {
-    (void)server;
     NimBLEDevice::getAdvertising()->stop();
-    NimBLEDevice::updateConnParams(desc->conn_handle, 800, 800, 20, 600);
+    server->updateConnParams(desc->conn_handle, 800, 800, 20, 600);
   }
 
   void onDisconnect(NimBLEServer *server) override {
